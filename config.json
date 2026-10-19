@@ -1,0 +1,65 @@
+{
+  "dry_run": true,
+  "paper_bankroll_usdc": 1000.0,
+
+  "claude": {
+    "model": "claude-sonnet-5-5",
+    "effort": "medium",
+    "max_tokens": 8000,
+    "timeout_s": 90,
+    "max_calls_per_hour": 20,
+    "max_calls_per_day": 150,
+    "max_concurrent_calls": 2
+  },
+
+  "trigger": {
+    "require_price_move": true,
+    "price_move_threshold": 0.03,
+    "price_window_s": 300,
+    "news_window_s": 180,
+    "market_cooldown_s": 900
+  },
+
+  "risk": {
+    "kelly_fraction": 0.25,
+    "max_exposure_per_market_pct": 0.05,
+    "max_total_exposure_pct": 0.40,
+    "min_usdc_reserve": 100.0,
+    "min_edge": 0.05,
+    "min_confidence": 0.6,
+    "max_spread": 0.05,
+    "max_slippage": 0.02,
+    "max_book_take_pct": 0.5,
+    "min_order_usdc": 5.0,
+    "stop_loss_pct": 0.30,
+    "take_profit_price": 0.97,
+    "max_daily_loss_pct": 0.10,
+    "position_check_interval_s": 15
+  },
+
+  "news": {
+    "x": {
+      "enabled": false,
+      "mode": "poll",
+      "poll_interval_s": 60,
+      "accounts": ["Reuters", "AP", "business", "WhiteHouse"],
+      "max_results": 50
+    },
+    "rss": {
+      "enabled": true,
+      "poll_interval_s": 60,
+      "feeds": [
+        "https://feeds.reuters.com/reuters/topNews",
+        "https://feeds.apnews.com/rss/apf-topnews"
+      ]
+    }
+  },
+
+  "markets": [
+    {
+      "slug": "remplacer-par-le-slug-du-marche",
+      "keywords": ["mot-cle 1", "mot cle 2", "\\bregex\\b"],
+      "notes": "Contexte optionnel transmis a Claude (ex: sources fiables, pieges de resolution)."
+    }
+  ]
+}

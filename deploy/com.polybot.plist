@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchDaemon: demarre au boot (sans session ouverte) et relance le bot s'il s'arrete.
+     __BOT_DIR__ et __USER__ sont remplaces par deploy/setup_macmini.sh -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.polybot</string>
+
+    <key>UserName</key>
+    <string>__USER__</string>
+
+    <key>WorkingDirectory</key>
+    <string>__BOT_DIR__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BOT_DIR__/.venv/bin/python</string>
+        <string>-u</string>
+        <string>__BOT_DIR__/main.py</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Relance systematique, quel que soit le code de sortie -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Au moins 30 s entre deux relances (evite une boucle de crash rapide) -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>__BOT_DIR__/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__BOT_DIR__/logs/launchd.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>
