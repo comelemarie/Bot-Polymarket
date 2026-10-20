@@ -27,8 +27,39 @@ def _json_list(value) -> list:
     return list(value or [])
 
 
+def parse_market(m: dict, keywords: list[str], notes: str = "") -> Market | None:
+    """Construit un Market depuis une ligne Gamma, ou None si non tradable (ferme, non binaire...)."""
+    slug = m.get("slug", "?")
+    if m.get("closed") or not m.get("active", True) or m.get("acceptingOrders") is False:
+        log.debug("Marche ferme/inactif ignore: %s", slug)
+        return None
+    try:
+        outcomes = [o.lower() for o in _json_list(m.get("outcomes"))]
+        tokens = _json_list(m.get("clobTokenIds"))
+    except (ValueError, TypeError):
+        return None
+    if len(tokens) != 2 or outcomes not in (["yes", "no"], ["no", "yes"]):
+        log.debug("Marche non binaire YES/NO ignore: %s (%s)", slug, outcomes)
+        return None
+    yes_idx = outcomes.index("yes")
+    return Market(
+        slug=slug,
+        question=m.get("question", ""),
+        description=m.get("description", ""),
+        end_date=m.get("endDate", ""),
+        condition_id=m.get("conditionId", ""),
+        yes_token_id=str(tokens[yes_idx]),
+        no_token_id=str(tokens[1 - yes_idx]),
+        tick_size=float(m.get("orderPriceMinTickSize") or 0.01),
+        neg_risk=bool(m.get("negRisk", False)),
+        liquidity_usdc=float(m.get("liquidityNum") or m.get("liquidity") or 0),
+        keywords=keywords,
+        notes=notes,
+    )
+
+
 async def load_markets(watchlist: list[MarketWatch]) -> dict[str, Market]:
-    """Resout chaque slug de la whitelist via l'API Gamma."""
+    """Resout chaque slug de la whitelist manuelle via l'API Gamma."""
     markets: dict[str, Market] = {}
     async with httpx.AsyncClient(timeout=20) as http:
         for watch in watchlist:
@@ -38,31 +69,12 @@ async def load_markets(watchlist: list[MarketWatch]) -> dict[str, Market]:
             if not rows:
                 log.error("Marche introuvable sur Gamma: %s", watch.slug)
                 continue
-            m = rows[0]
-            if m.get("closed") or not m.get("active", True):
-                log.warning("Marche ferme/inactif ignore: %s", watch.slug)
+            market = parse_market(rows[0], watch.keywords, watch.notes)
+            if market is None:
+                log.warning("Marche ferme, inactif ou non binaire ignore: %s", watch.slug)
                 continue
-            outcomes = [o.lower() for o in _json_list(m.get("outcomes"))]
-            tokens = _json_list(m.get("clobTokenIds"))
-            if len(tokens) != 2 or outcomes not in (["yes", "no"], ["no", "yes"]):
-                log.error("Marche non binaire YES/NO ignore: %s (%s)", watch.slug, outcomes)
-                continue
-            yes_idx = outcomes.index("yes")
-            markets[watch.slug] = Market(
-                slug=watch.slug,
-                question=m.get("question", ""),
-                description=m.get("description", ""),
-                end_date=m.get("endDate", ""),
-                condition_id=m.get("conditionId", ""),
-                yes_token_id=str(tokens[yes_idx]),
-                no_token_id=str(tokens[1 - yes_idx]),
-                tick_size=float(m.get("orderPriceMinTickSize") or 0.01),
-                neg_risk=bool(m.get("negRisk", False)),
-                liquidity_usdc=float(m.get("liquidityNum") or m.get("liquidity") or 0),
-                keywords=watch.keywords,
-                notes=watch.notes,
-            )
-            log.info("Marche charge: %s -> %s", watch.slug, markets[watch.slug].question)
+            markets[watch.slug] = market
+            log.info("Marche charge: %s -> %s", watch.slug, market.question)
     return markets
 
 
@@ -91,18 +103,40 @@ PriceCallback = Callable[[Market], Awaitable[None]]
 
 
 class PolymarketFeed:
-    """Maintient les carnets YES/NO de chaque marche surveille."""
+    """Maintient les carnets YES/NO des marches surveilles.
+
+    La liste des marches peut changer en cours de route (decouverte automatique):
+    `set_markets` met a jour les carnets et relance les abonnements WebSocket.
+    Les tokens sont repartis sur plusieurs connexions de `ASSETS_PER_CONNECTION` max.
+    """
+
+    ASSETS_PER_CONNECTION = 200
 
     def __init__(self, markets: dict[str, Market], price_window_s: float):
-        self.markets = markets
+        self.price_window_s = price_window_s
+        self.markets: dict[str, Market] = {}
         self.books: dict[str, OrderBook] = {}
-        self.history: dict[str, PriceHistory] = {slug: PriceHistory(price_window_s) for slug in markets}
+        self.history: dict[str, PriceHistory] = {}
         self._by_asset: dict[str, Market] = {}
-        for m in markets.values():
-            for tok in (m.yes_token_id, m.no_token_id):
-                self.books[tok] = OrderBook(tok)
-                self._by_asset[tok] = m
+        self._resubscribe = asyncio.Event()
         self.callbacks: list[PriceCallback] = []
+        self.set_markets(markets)
+
+    def set_markets(self, markets: dict[str, Market]) -> None:
+        old_assets = set(self.books)
+        self.markets = dict(markets)
+        self._by_asset = {}
+        books: dict[str, OrderBook] = {}
+        for m in self.markets.values():
+            for tok in (m.yes_token_id, m.no_token_id):
+                books[tok] = self.books.get(tok) or OrderBook(tok)
+                self._by_asset[tok] = m
+        self.books = books
+        self.history = {
+            slug: self.history.get(slug) or PriceHistory(self.price_window_s) for slug in self.markets
+        }
+        if set(self.books) != old_assets:
+            self._resubscribe.set()
 
     def on_price(self, cb: PriceCallback) -> None:
         self.callbacks.append(cb)
@@ -115,16 +149,34 @@ class PolymarketFeed:
 
     def is_fresh(self, market: Market, max_age_s: float = 120) -> bool:
         now = time.time()
-        return all(now - self.books[t].updated_at < max_age_s for t in (market.yes_token_id, market.no_token_id))
+        books = [self.books.get(t) for t in (market.yes_token_id, market.no_token_id)]
+        return all(b is not None and now - b.updated_at < max_age_s for b in books)
 
     async def run(self) -> None:
-        """Boucle de connexion avec reconnexion automatique."""
+        """Ouvre une connexion par paquet de tokens; tout est relance quand la liste change."""
+        while True:
+            self._resubscribe.clear()
+            assets = list(self.books)
+            chunks = [assets[i:i + self.ASSETS_PER_CONNECTION]
+                      for i in range(0, len(assets), self.ASSETS_PER_CONNECTION)]
+            log.info("Abonnement WebSocket: %d marches, %d tokens, %d connexion(s)",
+                     len(self.markets), len(assets), len(chunks))
+            tasks = [asyncio.create_task(self._connection(i, chunk)) for i, chunk in enumerate(chunks)]
+            try:
+                await self._resubscribe.wait()
+            finally:
+                for t in tasks:
+                    t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _connection(self, idx: int, assets: list[str]) -> None:
+        """Une connexion WebSocket avec reconnexion automatique."""
         backoff = 1
         while True:
             try:
                 async with websockets.connect(WS_URL, ping_interval=None, max_size=2**24) as ws:
-                    await ws.send(json.dumps({"assets_ids": list(self.books), "type": "market"}))
-                    log.info("WebSocket Polymarket connecte (%d tokens)", len(self.books))
+                    await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
+                    log.debug("WebSocket #%d connecte (%d tokens)", idx, len(assets))
                     backoff = 1
                     pinger = asyncio.create_task(self._ping(ws))
                     try:
@@ -135,7 +187,7 @@ class PolymarketFeed:
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # reseau, deconnexion serveur...
-                log.warning("WebSocket Polymarket coupe (%s), reconnexion dans %ss", e, backoff)
+                log.warning("WebSocket #%d coupe (%s), reconnexion dans %ss", idx, e, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
@@ -156,7 +208,9 @@ class PolymarketFeed:
         for ev in events:
             touched |= self._apply(ev)
         for slug in touched:
-            market = self.markets[slug]
+            market = self.markets.get(slug)
+            if market is None:
+                continue
             mid = self.yes_mid(market)
             if mid is not None:
                 self.history[slug].add(mid)

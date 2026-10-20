@@ -7,8 +7,8 @@
     "effort": "medium",
     "max_tokens": 8000,
     "timeout_s": 90,
-    "max_calls_per_hour": 20,
-    "max_calls_per_day": 150,
+    "max_calls_per_hour": 30,
+    "max_calls_per_day": 300,
     "max_concurrent_calls": 2
   },
 
@@ -49,17 +49,33 @@
       "enabled": true,
       "poll_interval_s": 60,
       "feeds": [
-        "https://feeds.reuters.com/reuters/topNews",
-        "https://feeds.apnews.com/rss/apf-topnews"
+        "https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en",
+        "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "https://feeds.bbci.co.uk/news/business/rss.xml",
+        "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml",
+        "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+        "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+        "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://www.coindesk.com/arc/outboundfeeds/rss/"
       ]
     }
   },
 
-  "markets": [
-    {
-      "slug": "remplacer-par-le-slug-du-marche",
-      "keywords": ["mot-cle 1", "mot cle 2", "\\bregex\\b"],
-      "notes": "Contexte optionnel transmis a Claude (ex: sources fiables, pieges de resolution)."
-    }
-  ]
+  "discovery": {
+    "enabled": true,
+    "refresh_interval_s": 3600,
+    "max_markets": 150,
+    "min_liquidity_usdc": 10000,
+    "min_volume_24h_usdc": 5000,
+    "min_hours_to_end": 24,
+    "max_days_to_end": 180,
+    "include_tags": [],
+    "exclude_tags": ["sports"],
+    "exclude_question_patterns": ["up or down"],
+    "exclude_slugs": [],
+    "keyword_model": "claude-haiku-5-5",
+    "max_pages": 10
+  },
+
+  "markets": []
 }

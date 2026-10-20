@@ -37,16 +37,30 @@ class TriggerEngine:
         price_move: Callable[[str], float],
         clock: Callable[[], float] = time.time,
     ):
-        self.markets = markets
         self.cfg = cfg
         self.price_move = price_move
         self.clock = clock
-        self.patterns = {
-            slug: [re.compile(k, re.IGNORECASE) for k in m.keywords] for slug, m in markets.items()
-        }
-        self.pending: dict[str, list[tuple[float, NewsItem]]] = {slug: [] for slug in markets}
+        self.markets: dict[str, Market] = {}
+        self.patterns: dict[str, list[re.Pattern]] = {}
+        self.pending: dict[str, list[tuple[float, NewsItem]]] = {}
         self.last_trigger: dict[str, float] = {}
-        self.seen_news: set[str] = set()
+        self.seen_news: dict[str, None] = {}  # ordonne par insertion, purge des plus anciens
+        self.set_markets(markets)
+
+    def set_markets(self, markets: dict[str, Market]) -> None:
+        """Remplace la liste des marches surveilles (conserve l'etat des marches deja connus)."""
+        patterns = {}
+        for slug, m in markets.items():
+            compiled = []
+            for k in m.keywords:
+                try:
+                    compiled.append(re.compile(k, re.IGNORECASE))
+                except re.error as e:
+                    log.warning("Mot-cle invalide ignore pour %s: %r (%s)", slug, k, e)
+            patterns[slug] = compiled
+        self.markets = dict(markets)
+        self.patterns = patterns
+        self.pending = {slug: self.pending.get(slug, []) for slug in markets}
 
     def matching_markets(self, news: NewsItem) -> list[str]:
         return [slug for slug, pats in self.patterns.items() if any(p.search(news.text) for p in pats)]
@@ -54,7 +68,9 @@ class TriggerEngine:
     def on_news(self, news: NewsItem) -> list[Trigger]:
         if news.id in self.seen_news:
             return []
-        self.seen_news.add(news.id)
+        self.seen_news[news.id] = None
+        if len(self.seen_news) > 50_000:
+            self.seen_news = dict.fromkeys(list(self.seen_news)[-25_000:])
         age = (datetime.now(timezone.utc) - news.published_at).total_seconds()
         if age > MAX_NEWS_AGE_S:
             return []
@@ -73,6 +89,8 @@ class TriggerEngine:
         return self._check(slug)
 
     def _check(self, slug: str) -> Trigger | None:
+        if slug not in self.markets:
+            return None
         now = self.clock()
         pending = [(ts, n) for ts, n in self.pending[slug] if now - ts <= self.cfg.news_window_s]
         self.pending[slug] = pending

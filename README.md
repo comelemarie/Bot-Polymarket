@@ -41,13 +41,14 @@ déterministe décider de la taille de la position.
 ```
 Bot-Polymarket/
 ├── .env.example            # Clés API (Anthropic, X, clé privée Polygon) → copier en .env
-├── config.json             # Limites de risque, budget Claude, sources, whitelist de marchés
+├── config.json             # Limites de risque, budget Claude, sources, découverte des marchés
 ├── main.py                 # Boucle asyncio principale + tâches supervisées
 ├── core/                   # Config, modèles, état persistant (positions, PnL du jour)
 ├── ingestion/
 │   ├── twitter_stream.py   # X API v2 : polling (recherche récente) ou filtered stream
 │   ├── rss_feed.py         # Flux RSS d'agences (gratuit, complément de X)
 │   ├── news_filter.py      # Filtre local : mot-clé + variation de prix
+│   ├── market_discovery.py # Sélection automatique des marchés + mots-clés générés par Haiku
 │   └── polymarket_ws.py    # Métadonnées Gamma + carnet d'ordres temps réel
 ├── brain/
 │   └── claude_analyst.py   # Requête structurée à l'API Anthropic
@@ -72,6 +73,42 @@ Bot-Polymarket/
 **À savoir sur le déclencheur « mot-clé + variation de prix »** : il économise beaucoup d'appels, mais
 quand le prix a déjà bougé, une partie de l'edge a disparu. Mets `"require_price_move": false` pour
 appeler Claude dès qu'un mot-clé apparaît, ce qui sera plus rapide mais plus cher.
+
+## Sélection automatique des marchés
+
+Avec `discovery.enabled: true` (réglage par défaut), le bot choisit seul les marchés à surveiller.
+Il refait cette sélection toutes les heures (`refresh_interval_s`).
+
+1. **Lecture** des events actifs sur l'API Polymarket (Gamma), triés par volume 24 h
+   (jusqu'à `max_pages` × 100 events).
+2. **Filtres**. Un marché est retenu s'il :
+   - est un marché YES/NO ouvert aux ordres ;
+   - a une liquidité ≥ `min_liquidity_usdc` et un volume 24 h ≥ `min_volume_24h_usdc` ;
+   - se termine entre `min_hours_to_end` heures et `max_days_to_end` jours ;
+   - n'est pas exclu par `exclude_tags`, `exclude_question_patterns` ou `exclude_slugs`.
+
+   Si `include_tags` n'est pas vide, seules ces catégories sont gardées (ex. `["politics", "crypto"]`).
+   On garde ensuite les `max_markets` plus actifs.
+3. **Mots-clés** : pour chaque nouveau marché, Claude Haiku propose 3 à 8 expressions qu'on
+   retrouverait dans un titre d'actualité (noms, organisations, termes précis). Les marchés sont
+   traités par lots de 25 et le résultat est mis en cache dans `state/keywords_cache.json` : on ne
+   paie qu'une fois par marché, quelques centimes pour 150 marchés. Si l'appel échoue, le bot utilise
+   les noms propres de la question et retente au rafraîchissement suivant.
+
+Par défaut, deux types de marchés sont exclus :
+- **le sport** (`exclude_tags: ["sports"]`) : pendant un match, le prix bouge en continu, ce qui
+  satisferait sans cesse la condition « variation de prix » ;
+- **les marchés crypto « Up or Down »** à très courte échéance, qui réagissent au cours et non à
+  l'actualité.
+
+Retire ces exclusions si tu veux quand même ces marchés.
+
+Un marché où tu as une position ouverte reste toujours surveillé (pour le stop-loss), même s'il ne
+passe plus les filtres. La liste manuelle `markets` reste disponible : ses marchés s'ajoutent à la
+sélection automatique avec tes propres mots-clés et notes.
+
+Pour vérifier la sélection et les mots-clés générés, regarde les lignes `Decouverte:` et
+`Marches surveilles:` dans `logs/bot.log`, ainsi que le fichier `state/keywords_cache.json`.
 
 ## Moteur de risque
 
@@ -105,12 +142,15 @@ exécutions et sorties.
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env && chmod 600 .env   # puis remplir
-python -m pytest                          # 15 tests
+python -m pytest                          # 20 tests
 ```
 
-1. **Marchés** : dans `config.json → markets`, mets le `slug` de chaque marché (la fin de l'URL
-   `polymarket.com/event/...`) et ses mots-clés. Seuls les marchés binaires YES/NO sont pris en charge.
-2. **Sources** : le RSS est actif par défaut. Pour X, mets `news.x.enabled` à `true`, renseigne
+1. **Marchés** : la sélection automatique est active par défaut (voir plus haut). Tu peux aussi
+   ajouter des marchés à la main dans `config.json → markets`, avec leur `slug` et leurs mots-clés.
+   Le slug est le dernier segment de l'URL : `polymarket.com/event/<event>/<slug-du-marché>`, ou
+   `polymarket.com/event/<slug>` si l'event ne contient qu'un marché.
+2. **Sources** : le RSS est actif par défaut (Google News, BBC, NYT, CNBC, Al Jazeera, CoinDesk).
+   Plus tu surveilles de marchés, plus la couverture d'actualité compte. Pour X, mets `news.x.enabled` à `true`, renseigne
    `X_BEARER_TOKEN` et choisis le mode `poll` (tiers d'API d'entrée de gamme) ou `stream` (filtered
    stream, qui demande un accès supérieur).
 3. **Lancer** : `python main.py`.
@@ -158,8 +198,10 @@ battement (toutes les 5 min) et peut servir à une supervision externe.
   bornent les dégâts quelle que soit la réponse de Claude.
 - **Clé privée** : `.env` est exclu de git et passé en `chmod 600`. Utilise un wallet dédié au bot,
   avec seulement le capital alloué.
-- **Coût Claude** : plafonné par `max_calls_per_hour` / `max_calls_per_day`. Chaque appel coûte
-  quelques milliers de tokens.
+- **Coût Claude** : plafonné par `max_calls_per_hour` / `max_calls_per_day` (30 / 300 par défaut).
+  Un appel d'analyse coûte de l'ordre de 1 à 5 centimes de dollar, soit au pire quelques dollars à
+  une quinzaine de dollars par jour avec ces plafonds. La génération des mots-clés (Haiku) est
+  négligeable.
 - **Accès à Polymarket** : la plateforme bloque certains pays (dont la France) pour le trading. Vérifie
   ta situation avant de passer en réel.
 - Le mode papier simule les exécutions contre le carnet réel (FOK), mais pas l'impact de tes propres

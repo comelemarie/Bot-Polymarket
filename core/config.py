@@ -63,6 +63,24 @@ class NewsConfig(BaseModel):
     rss: RssConfig = RssConfig()
 
 
+class DiscoveryConfig(BaseModel):
+    """Selection automatique des marches a surveiller (en plus de la liste manuelle `markets`)."""
+
+    enabled: bool = False
+    refresh_interval_s: float = 3600
+    max_markets: int = 150
+    min_liquidity_usdc: float = 10_000
+    min_volume_24h_usdc: float = 5_000
+    min_hours_to_end: float = 24
+    max_days_to_end: float = 180
+    include_tags: list[str] = []  # vide = toutes les categories
+    exclude_tags: list[str] = []
+    exclude_question_patterns: list[str] = []  # regex, insensibles a la casse
+    exclude_slugs: list[str] = []
+    keyword_model: str = "claude-haiku-5-5"
+    max_pages: int = 10  # pages de 100 events lues sur l'API Gamma
+
+
 class MarketWatch(BaseModel):
     slug: str
     keywords: list[str]
@@ -76,7 +94,8 @@ class BotConfig(BaseModel):
     trigger: TriggerConfig = TriggerConfig()
     risk: RiskConfig = RiskConfig()
     news: NewsConfig = NewsConfig()
-    markets: list[MarketWatch]
+    discovery: DiscoveryConfig = DiscoveryConfig()
+    markets: list[MarketWatch] = []
 
 
 class Secrets(BaseModel):

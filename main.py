@@ -13,11 +13,12 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from brain.claude_analyst import ClaudeAnalyst
-from core.config import BotConfig, Secrets, load_config, load_secrets
+from core.config import BotConfig, MarketWatch, Secrets, load_config, load_secrets
 from core.models import Market, NewsItem
 from core.state import PortfolioState
 from execution.polygon_clob import ClobExecutor
 from execution.risk_manager import RiskManager, floor_to_tick
+from ingestion.market_discovery import KeywordGenerator, discover_markets, phrase_to_regex
 from ingestion.news_filter import Trigger, TriggerEngine
 from ingestion.polymarket_ws import PolymarketFeed, load_markets
 from ingestion.rss_feed import poll_rss
@@ -69,6 +70,47 @@ class Bot:
         self.trade_lock = asyncio.Lock()  # une seule decision d'ordre a la fois (exposition coherente)
         self.feed.on_price(self._on_price)
         self._background: set[asyncio.Task] = set()
+        self.keywords = (
+            KeywordGenerator(secrets.anthropic_api_key, cfg.discovery.keyword_model)
+            if cfg.discovery.enabled else None
+        )
+
+    # --- liste des marches surveilles ---
+    def set_markets(self, markets: dict[str, Market]) -> None:
+        added, removed = markets.keys() - self.markets.keys(), self.markets.keys() - markets.keys()
+        self.markets = markets
+        self.feed.set_markets(markets)  # avant le filtre: il lit l'historique de prix du flux
+        self.triggers.set_markets(markets)
+        if added or removed:
+            log.info("Marches surveilles: %d (+%d / -%d)", len(markets), len(added), len(removed))
+
+    async def refresh_markets(self) -> None:
+        """Liste manuelle + decouverte automatique + marches ou une position est ouverte."""
+        markets = await load_markets(self.cfg.markets) if self.cfg.markets else {}
+        if self.keywords:
+            discovered = await discover_markets(self.cfg.discovery, self.keywords)
+            markets = {**discovered, **markets}  # la liste manuelle garde ses propres mots-cles
+        # Une position ouverte doit rester surveillee (stop-loss) meme si le marche sort des filtres.
+        orphans = {p.market_slug for p in self.state.positions.values()} - markets.keys()
+        for slug in list(orphans):
+            if slug in self.markets:
+                markets[slug] = self.markets[slug]
+                orphans.discard(slug)
+        if orphans:
+            watches = []
+            for slug in orphans:
+                phrases = (self.keywords.cached(slug) if self.keywords else None) or []
+                watches.append(MarketWatch(slug=slug, keywords=[phrase_to_regex(k) for k in phrases]))
+            markets.update(await load_markets(watches))
+        self.set_markets(markets)
+
+    async def discovery_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.cfg.discovery.refresh_interval_s)
+            try:
+                await self.refresh_markets()
+            except Exception:
+                log.exception("Rafraichissement des marches echoue, on garde la liste actuelle")
 
     def _spawn(self, trig: Trigger) -> None:
         """Lance l'analyse en tache de fond (ne bloque pas le WebSocket ni la file d'actus)."""
@@ -122,8 +164,8 @@ class Bot:
             yes_mid=yes_book.mid,
             assessment=asdict(assessment) if assessment else None,
         )
-        if assessment is None:
-            return
+        if assessment is None or market.slug not in self.markets:
+            return  # pas d'avis, ou marche retire de la surveillance pendant l'analyse
 
         async with self.trade_lock:
             usdc, equity = await self.equity()
@@ -196,6 +238,8 @@ class Bot:
             supervised("positions", self.monitor_positions),
             supervised("heartbeat", self.heartbeat),
         ]
+        if self.cfg.discovery.enabled:
+            tasks.append(supervised("discovery", self.discovery_loop))
         if self.cfg.news.rss.enabled and self.cfg.news.rss.feeds:
             tasks.append(supervised("rss", lambda: poll_rss(self.cfg.news.rss, self.news_queue)))
         if self.cfg.news.x.enabled:
@@ -212,11 +256,11 @@ async def amain(config_path: str) -> None:
     secrets = load_secrets()
     if not secrets.anthropic_api_key:
         log.warning("ANTHROPIC_API_KEY absent de .env: le SDK tentera les autres sources d'identifiants")
-    markets = await load_markets(cfg.markets)
-    if not markets:
-        log.error("Aucun marche valide dans la whitelist, arret.")
+    bot = Bot(cfg, secrets, {})
+    await bot.refresh_markets()
+    if not bot.markets:
+        log.error("Aucun marche a surveiller (liste manuelle vide/invalide et decouverte sans resultat), arret.")
         sys.exit(1)
-    bot = Bot(cfg, secrets, markets)
 
     loop = asyncio.get_running_loop()
     main_task = asyncio.current_task()
