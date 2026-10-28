@@ -1,0 +1,16 @@
+# Secrets: passes au conteneur avec --env-file, jamais copies dans l'image
+.env
+.env.*
+!.env.example
+
+# Etat local et donnees (montes en volumes)
+state/
+logs/
+data/
+
+# Inutile dans l'image
+.git/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

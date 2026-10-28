@@ -88,6 +88,26 @@ sqlite3 state/bot.db "SELECT created_at, market_slug, action, reason FROM decisi
 
 Sur un Mac mini 24 h/24 : `./deploy/setup_macmini.sh` (service launchd, redémarrage automatique).
 
+### Avec Docker
+
+```bash
+docker build -t polybot .
+docker run -d --name polybot --restart unless-stopped --env-file .env \
+  -v "$PWD/state:/app/state" -v "$PWD/logs:/app/logs" -v "$PWD/data:/app/data" polybot
+docker logs -f polybot                                  # suivre les logs
+docker exec polybot python main.py --status             # état, coupe-circuits
+docker exec polybot python main.py --halt               # arrêt d'urgence
+```
+
+- `.env` n'est **jamais** copié dans l'image (`.dockerignore`) : les secrets sont passés au lancement
+  avec `--env-file`.
+- Les volumes `state/`, `logs/` et `data/` conservent la base (positions, ordres, budget Claude), les
+  logs et les enregistrements quand le conteneur est recréé. Sans eux, le bot repartirait sans mémoire
+  de ses positions.
+- `--restart unless-stopped` relance le conteneur après un crash ou un redémarrage de la machine.
+- `docker stop` envoie SIGTERM : le bot s'arrête proprement, mais cela ne ferme aucune position
+  (`docs/OPERATIONS.md`).
+
 ## Replay et validation
 
 ```bash
