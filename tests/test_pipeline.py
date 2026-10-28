@@ -1,61 +1,88 @@
-"""Test de bout en bout en mode papier: WebSocket simule -> actu -> Claude simule -> ordre fictif."""
+"""Bout en bout: actualite -> detection -> analyse -> avantage -> risque -> ordre papier, tracable en base."""
 import json
-from datetime import datetime, timezone
 
 import pytest
 
-from core.config import BotConfig, Secrets
-from core.models import Assessment, Market, NewsItem
-from main import Bot
-
-
-def market() -> Market:
-    return Market("fed", "Fed cut?", "rules", "", "c", "Y", "N", 0.01, False, 50_000, ["rate cut"])
-
-
-def book_event(asset: str, bid: float, ask: float) -> str:
-    return json.dumps([{
-        "event_type": "book", "asset_id": asset,
-        "bids": [{"price": str(bid), "size": "5000"}],
-        "asks": [{"price": str(ask), "size": "5000"}],
-    }])
+from tests.helpers import T0, FakeAnalyst, assessment, connect_and_book, make_bot, market, news, run_scheduled
 
 
 @pytest.mark.asyncio
-async def test_paper_trade_end_to_end(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    cfg = BotConfig.model_validate({"markets": [{"slug": "fed", "keywords": ["rate cut"]}],
-                                    "paper_bankroll_usdc": 10_000})
-    bot = Bot(cfg, Secrets(anthropic_api_key="test", x_bearer_token=None, polygon_private_key=None,
-                           signature_type=1, funder_address=None), {"fed": market()})
-    await bot.executor.start()
+async def test_news_to_paper_trade_is_fully_traceable(tmp_path):
+    bot, clock, sched = make_bot(tmp_path, analyst=FakeAnalyst(assessment(p=0.85), latency=5))
+    m = market()
+    bot.set_markets({m.slug: m})
+    await connect_and_book(bot, m, {0.49: 5000}, {0.50: 5000}, {0.49: 5000}, {0.51: 5000})
+    await bot.on_news(news(t=T0))
+    await run_scheduled(sched, clock, T0 + 60)
 
-    captured = {}
-
-    async def fake_assess(m, news, yes_book, no_book):
-        captured["news"] = news
-        return Assessment(True, 0.85, 0.9, False, "test", [])
-
-    monkeypatch.setattr(bot.analyst, "assess", fake_assess)
-
-    await bot.feed._handle(book_event("Y", 0.49, 0.50))
-    await bot.feed._handle(book_event("N", 0.50, 0.51))
-    await bot.news_queue.put(NewsItem("x:@t", "Fed announces rate cut", "", datetime.now(timezone.utc), "n1"))
-    trig = bot.triggers.on_news(await bot.news_queue.get())
-    assert trig == []  # pas encore de variation de prix
-
-    # Nouveau format price_change: le YES monte de 5 points
-    await bot.feed._handle(json.dumps({"event_type": "price_change", "market": "c", "price_changes": [
-        {"asset_id": "Y", "price": "0.50", "size": "0", "side": "SELL"},
-        {"asset_id": "Y", "price": "0.55", "size": "5000", "side": "SELL"},
-        {"asset_id": "Y", "price": "0.54", "size": "5000", "side": "BUY"},
-    ]}))
-    for t in list(bot._background):
-        await t
-
-    assert captured["news"][0].id == "n1"
-    pos = bot.state.positions.get("Y")
+    pos = bot.portfolio.position("Y")
     assert pos is not None and pos.outcome == "YES"
-    assert pos.cost_usdc <= 0.05 * 10_000 + 1e-6
-    assert bot.state.paper_usdc == pytest.approx(10_000 - pos.cost_usdc)
-    assert (tmp_path / "logs" / "decisions.jsonl").exists()
+    s = bot.store
+    ev = s.one("SELECT * FROM events WHERE kind='news_only'")
+    dec = s.one("SELECT * FROM decisions WHERE action='trade'")
+    order = s.one("SELECT * FROM orders")
+    assert dec["event_id"] == ev["id"] and order["decision_id"] == dec["id"]
+    assert json.loads(ev["news_ids"]) == ["n1"]
+    assert json.loads(dec["details"])["execution"] == "filled"
+    assert s.one("SELECT COUNT(*) n FROM market_snapshots WHERE ref_id=?", (f"decide:{ev['id']}",))["n"] == 2
+    assert order["created_at"] >= T0 + 5  # decision prise apres la latence du modele
+
+
+@pytest.mark.asyncio
+async def test_decision_uses_book_at_decision_time(tmp_path):
+    bot, clock, sched = make_bot(tmp_path, analyst=FakeAnalyst(assessment(p=0.60, lo=0.58, hi=0.62), latency=8))
+    m = market()
+    bot.set_markets({m.slug: m})
+    await connect_and_book(bot, m, {0.49: 5000}, {0.50: 5000}, {0.49: 5000}, {0.51: 5000})
+    await bot.on_news(news(t=T0))
+    # Pendant l'analyse, le marche reagit: l'ask YES passe a 0.56, l'avantage residuel disparait.
+    await connect_and_book(bot, m, {0.55: 5000}, {0.56: 5000}, {0.43: 5000}, {0.45: 5000}, t=T0 + 4)
+    await run_scheduled(sched, clock, T0 + 60)
+    assert bot.portfolio.position("Y") is None
+    assert "avantage net insuffisant" in bot.store.one("SELECT reason FROM decisions")["reason"]
+
+
+@pytest.mark.asyncio
+async def test_abstention_never_trades(tmp_path):
+    bot, clock, sched = make_bot(tmp_path, analyst=FakeAnalyst(assessment(abstain=True, abstain_reason="ambigu")))
+    m = market()
+    bot.set_markets({m.slug: m})
+    await connect_and_book(bot, m, {0.49: 5000}, {0.50: 5000}, {0.49: 5000}, {0.51: 5000})
+    await bot.on_news(news(t=T0))
+    await run_scheduled(sched, clock, T0 + 60)
+    assert bot.store.one("SELECT COUNT(*) n FROM orders")["n"] == 0
+    assert bot.store.one("SELECT reason FROM decisions")["reason"].startswith("abstention")
+
+
+@pytest.mark.asyncio
+async def test_emergency_halt_blocks_entries_and_flattens(tmp_path):
+    bot, clock, sched = make_bot(tmp_path, analyst=FakeAnalyst(assessment(p=0.85)))
+    m = market()
+    bot.set_markets({m.slug: m})
+    await connect_and_book(bot, m, {0.49: 5000}, {0.50: 5000}, {0.49: 5000}, {0.51: 5000})
+    await bot.on_news(news(t=T0))
+    await run_scheduled(sched, clock, T0 + 60)
+    assert bot.portfolio.position("Y") is not None
+    bot.portfolio.halt("manuel", "test", clock.now())
+    bot.store.kv_set("emergency_request", {"flatten": True})
+    await bot.check_emergency()
+    assert bot.portfolio.position("Y") is None
+    clock.set(T0 + 2000)
+    await bot.on_news(news("new rate cut headline", "n2", t=T0 + 2000, url="https://b/2"))
+    await run_scheduled(sched, clock, T0 + 2100)
+    assert "coupe-circuit" in bot.store.one("SELECT reason FROM decisions ORDER BY created_at DESC")["reason"]
+
+
+@pytest.mark.asyncio
+async def test_stop_loss_triggers_on_quiet_but_synced_market(tmp_path):
+    bot, clock, sched = make_bot(tmp_path, analyst=FakeAnalyst(assessment(p=0.85)))
+    m = market()
+    bot.set_markets({m.slug: m})
+    await connect_and_book(bot, m, {0.49: 5000}, {0.50: 5000}, {0.49: 5000}, {0.51: 5000})
+    await bot.on_news(news(t=T0))
+    await run_scheduled(sched, clock, T0 + 60)
+    await connect_and_book(bot, m, {0.30: 5000}, {0.32: 5000}, {0.67: 5000}, {0.69: 5000}, t=T0 + 100)
+    clock.set(T0 + 900)  # 13 minutes sans aucune mise a jour du carnet
+    await bot.check_positions()
+    assert bot.portfolio.position("Y") is None
+    assert bot.store.one("SELECT reason FROM exits")["reason"] == "stop_price"

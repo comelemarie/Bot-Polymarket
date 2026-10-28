@@ -1,5 +1,5 @@
 {
-  "dry_run": true,
+  "mode": "paper",
   "paper_bankroll_usdc": 1000.0,
 
   "claude": {
@@ -7,34 +7,75 @@
     "effort": "medium",
     "max_tokens": 8000,
     "timeout_s": 90,
+    "max_retries": 2,
     "max_calls_per_hour": 30,
     "max_calls_per_day": 300,
-    "max_concurrent_calls": 2
+    "max_cost_usd_per_day": 10.0,
+    "max_concurrent_calls": 2,
+    "price_input_per_mtok": 2.0,
+    "price_output_per_mtok": 10.0,
+    "cache_ttl_s": 1800,
+    "cache_price_bucket": 0.02
   },
 
   "trigger": {
-    "require_price_move": true,
+    "news_only_enabled": true,
     "price_move_threshold": 0.03,
     "price_window_s": 300,
     "news_window_s": 180,
-    "market_cooldown_s": 900
+    "anomaly_move_threshold": 0.05,
+    "anomaly_watch_s": 1800,
+    "market_cooldown_s": 900,
+    "max_news_age_s": 3600,
+    "min_source_reliability": 0.4,
+    "max_spread_for_analysis": 0.08,
+    "min_depth_usdc_for_analysis": 200
+  },
+
+  "fees": {
+    "fetch_from_api": true,
+    "fallback_taker_fee_rate": 0.07,
+    "cache_ttl_s": 3600
+  },
+
+  "edge": {
+    "min_net_edge": 0.04,
+    "slippage_buffer": 0.005,
+    "min_half_width": {"low": 0.03, "medium": 0.07, "high": 0.15}
   },
 
   "risk": {
     "kelly_fraction": 0.25,
+    "uncertainty_size_multiplier": {"low": 1.0, "medium": 0.5, "high": 0.0},
+    "min_confidence": "medium",
+    "max_position_usdc": 100.0,
     "max_exposure_per_market_pct": 0.05,
+    "max_exposure_per_event_pct": 0.08,
+    "max_exposure_per_theme_pct": 0.20,
     "max_total_exposure_pct": 0.40,
+    "ignored_theme_tags": ["all", "featured", "trending", "new"],
     "min_usdc_reserve": 100.0,
-    "min_edge": 0.05,
-    "min_confidence": 0.6,
-    "max_spread": 0.05,
-    "max_slippage": 0.02,
     "max_book_take_pct": 0.5,
     "min_order_usdc": 5.0,
+    "max_daily_loss_pct": 0.05,
+    "max_drawdown_pct": 0.15
+  },
+
+  "exits": {
     "stop_loss_pct": 0.30,
+    "max_loss_at_entry_pct": 0.40,
     "take_profit_price": 0.97,
-    "max_daily_loss_pct": 0.10,
-    "position_check_interval_s": 15
+    "thesis_invalidation": true,
+    "exit_slippage": 0.02,
+    "check_interval_s": 15
+  },
+
+  "market_data": {
+    "resync_interval_s": 1800,
+    "max_silence_s": 90,
+    "verify_rest_before_order": true,
+    "max_rest_price_divergence": 0.01,
+    "validate_ws_best_prices": true
   },
 
   "news": {
@@ -58,7 +99,21 @@
         "https://www.aljazeera.com/xml/rss/all.xml",
         "https://www.coindesk.com/arc/outboundfeeds/rss/"
       ]
-    }
+    },
+    "source_reliability": {
+      "x:@Reuters": 0.85,
+      "x:@AP": 0.85,
+      "x:@WhiteHouse": 0.8,
+      "rss:feeds.bbci.co.uk": 0.8,
+      "rss:rss.nytimes.com": 0.8,
+      "rss:www.cnbc.com": 0.7,
+      "rss:www.aljazeera.com": 0.7,
+      "rss:www.coindesk.com": 0.6,
+      "rss:news.google.com": 0.5
+    },
+    "default_reliability": 0.5,
+    "dedup_window_h": 24,
+    "dedup_similarity": 0.8
   },
 
   "discovery": {
@@ -75,6 +130,26 @@
     "exclude_slugs": [],
     "keyword_model": "claude-haiku-5-5",
     "max_pages": 10
+  },
+
+  "storage": {
+    "db_path": "state/bot.db",
+    "record_dir": "data/recordings",
+    "record_market_data": true
+  },
+
+  "replay": {
+    "analysis_source": "recorded",
+    "default_model_latency_s": 10.0,
+    "processing_latency_s": 0.5,
+    "execution_latency_s": 1.0
+  },
+
+  "live": {
+    "confirmation": "",
+    "max_allowed_kelly_fraction": 0.5,
+    "max_allowed_exposure_per_market_pct": 0.10,
+    "max_allowed_total_exposure_pct": 0.60
   },
 
   "markets": []

@@ -1,124 +1,148 @@
-"""Envoi des ordres sur le CLOB Polymarket (py-clob-client), avec mode papier (dry_run).
+"""Courtier REEL: CLOB Polymarket (reseau Polygon) via py-clob-client 0.34.x.
 
-Ordres FOK (fill-or-kill) uniquement: soit l'ordre est entierement execute au prix limite ou mieux,
-soit il est annule. Aucun ordre ne reste dans le carnet a l'insu du bot.
+Instancie uniquement en mode LIVE apres le deverrouillage de core/modes.py.
+Classification des resultats d'envoi (d'apres py_clob_client.http_helpers et exceptions):
+  - erreur avant l'envoi (construction/signature)        -> rejected (rien n'a quitte la machine)
+  - PolyApiException status 4xx (sauf 408)                -> rejected (refus explicite du serveur)
+  - PolyApiException sans status (httpx.RequestError: delai, coupure), 408, 5xx
+                                                         -> unknown: l'ordre a PU etre execute
+  - reponse success + status "matched"                    -> filled
+  - status "delayed" / "live" / autre                     -> unknown (verification obligatoire)
+Un ordre UNKNOWN bloque toute nouvelle entree sur le marche jusqu'a reconciliation.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import AssetType, BalanceAllowanceParams, OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY, SELL
+import httpx
 
 from core.config import Secrets
-from core.models import Fill, OrderBook
-from core.state import PortfolioState
+from core.models import OrderRequest, SubmitResult
+from ingestion.market_state import BookState
 
 log = logging.getLogger(__name__)
 
 CLOB_HOST = "https://clob.polymarket.com"
+DATA_API = "https://data-api.polymarket.com"
 POLYGON_CHAIN_ID = 137
 USDC_DECIMALS = 6
 
 
-def simulate_fok(levels: dict[float, float], shares: float, limit: float, side: str) -> float | None:
-    """Prix moyen d'execution d'un FOK contre le carnet, ou None si profondeur insuffisante."""
-    if side == BUY:
-        prices = sorted(p for p in levels if p <= limit + 1e-9)
-    else:
-        prices = sorted((p for p in levels if p >= limit - 1e-9), reverse=True)
-    remaining, cost = shares, 0.0
-    for p in prices:
-        take = min(remaining, levels[p])
-        cost += take * p
-        remaining -= take
-        if remaining <= 1e-9:
-            return cost / shares
-    return None
+def classify_exception(e: Exception) -> SubmitResult:
+    from py_clob_client.exceptions import PolyApiException
+
+    if isinstance(e, PolyApiException):
+        code = e.status_code
+        if code is not None and 400 <= code < 500 and code != 408:
+            return SubmitResult("rejected", error=f"HTTP {code}: {e.error_msg}")
+        return SubmitResult("unknown", error=f"reponse ambigue (HTTP {code}): {e.error_msg}")
+    return SubmitResult("unknown", error=f"exception pendant l'envoi: {e!r}")
 
 
-class ClobExecutor:
-    def __init__(self, secrets: Secrets, dry_run: bool, state: PortfolioState, paper_bankroll: float):
+def parse_post_response(resp: dict | None, side: str, req: OrderRequest) -> SubmitResult:
+    if not isinstance(resp, dict):
+        return SubmitResult("unknown", error=f"reponse inattendue: {resp!r}")
+    oid = str(resp.get("orderID") or resp.get("orderId") or "")
+    status = str(resp.get("status", "")).lower()
+    if not resp.get("success", False):
+        return SubmitResult("rejected", error=str(resp.get("errorMsg") or resp), exchange_order_id=oid, raw=resp)
+    if status != "matched":
+        return SubmitResult("unknown", error=f"statut '{status}'", exchange_order_id=oid, raw=resp)
+    try:  # BUY: making = USDC, taking = parts recues. SELL: making = parts, taking = USDC.
+        making, taking = float(resp["makingAmount"]), float(resp["takingAmount"])
+    except (KeyError, TypeError, ValueError):
+        return SubmitResult("unknown", error="montants executes absents", exchange_order_id=oid, raw=resp)
+    if making <= 0 or taking <= 0:
+        return SubmitResult("unknown", error="montants executes nuls", exchange_order_id=oid, raw=resp)
+    if side == "BUY":
+        return SubmitResult("filled", taking, making / taking, 0.0, oid, raw={**resp, "cost_usdc": making})
+    return SubmitResult("filled", making, taking / making, 0.0, oid, raw={**resp, "proceeds_usdc": taking})
+
+
+class LiveClobBroker:
+    live = True
+
+    def __init__(self, secrets: Secrets):
         self.secrets = secrets
-        self.dry_run = dry_run
-        self.state = state
-        self.paper_bankroll = paper_bankroll
-        self.client: ClobClient | None = None
+        self.client = None
+        self.http = httpx.AsyncClient(timeout=15)
 
     async def start(self) -> None:
-        if self.dry_run:
-            if self.state.paper_usdc is None:
-                self.state.paper_usdc = self.paper_bankroll
-                self.state.save()
-            log.warning("MODE PAPIER (dry_run): aucun ordre reel ne sera envoye. Solde fictif %.2f USDC",
-                        self.state.paper_usdc)
-            return
-        if not self.secrets.polygon_private_key:
-            raise RuntimeError("POLYGON_PRIVATE_KEY manquant dans .env (requis hors dry_run)")
+        from py_clob_client.client import ClobClient
 
-        def _init() -> ClobClient:
-            client = ClobClient(
-                CLOB_HOST,
-                chain_id=POLYGON_CHAIN_ID,
-                key=self.secrets.polygon_private_key,
-                signature_type=self.secrets.signature_type,
-                funder=self.secrets.funder_address,
-            )
+        def _init():
+            client = ClobClient(CLOB_HOST, chain_id=POLYGON_CHAIN_ID, key=self.secrets.polygon_private_key,
+                                signature_type=self.secrets.signature_type, funder=self.secrets.funder_address)
             client.set_api_creds(client.create_or_derive_api_creds())
             return client
 
         self.client = await asyncio.to_thread(_init)
-        log.warning("MODE REEL: connecte au CLOB Polymarket. Solde %.2f USDC", await self.usdc_balance())
 
-    async def usdc_balance(self) -> float:
-        if self.dry_run:
-            return float(self.state.paper_usdc or 0.0)
-        resp = await asyncio.to_thread(
-            self.client.get_balance_allowance, BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-        )
-        return int(resp["balance"]) / 10**USDC_DECIMALS
+    @property
+    def account(self) -> str:
+        return self.secrets.funder_address or self.client.get_address()
 
-    async def buy(self, token_id: str, limit: float, shares: float, book: OrderBook) -> Fill | None:
-        return await self._execute(token_id, BUY, limit, shares, book)
-
-    async def sell(self, token_id: str, limit: float, shares: float, book: OrderBook) -> Fill | None:
-        return await self._execute(token_id, SELL, limit, shares, book)
-
-    async def _execute(self, token_id: str, side: str, limit: float, shares: float, book: OrderBook) -> Fill | None:
-        if self.dry_run:
-            levels = book.asks if side == BUY else book.bids
-            avg = simulate_fok(levels, shares, limit, side)
-            if avg is None:
-                log.info("[PAPIER] FOK %s %.2f @ %.3f annule: profondeur insuffisante", side, shares, limit)
-                return None
-            notional = avg * shares
-            self.state.paper_usdc += -notional if side == BUY else notional
-            self.state.save()
-            log.info("[PAPIER] %s %.2f shares @ %.4f (%.2f USDC)", side, shares, avg, notional)
-            return Fill(token_id, side, avg, shares, f"paper-{uuid.uuid4().hex[:8]}", simulated=True)
-
-        def _post():
-            signed = self.client.create_order(OrderArgs(token_id=token_id, price=limit, size=shares, side=side))
-            return self.client.post_order(signed, OrderType.FOK)
+    async def balance(self) -> float | None:
+        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
 
         try:
-            resp = await asyncio.to_thread(_post)
-        except Exception as e:  # py-clob-client leve PolyApiException et diverses erreurs HTTP
-            log.error("Ordre %s %s refuse: %s", side, token_id, e)
+            resp = await asyncio.to_thread(self.client.get_balance_allowance,
+                                           BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+            return int(resp["balance"]) / 10**USDC_DECIMALS
+        except Exception as e:
+            log.error("Solde USDC indisponible: %s", e)
             return None
-        if not resp or not resp.get("success") or resp.get("status") not in ("matched", "MATCHED"):
-            log.warning("Ordre %s non execute: %s", side, resp)
+
+    async def submit_fok(self, req: OrderRequest, book: BookState, fee_rate: float) -> SubmitResult:
+        from py_clob_client.clob_types import OrderArgs, OrderType
+
+        try:
+            signed = await asyncio.to_thread(
+                self.client.create_order,
+                OrderArgs(token_id=req.token_id, price=req.limit_price, size=req.shares, side=req.side))
+        except Exception as e:
+            return SubmitResult("rejected", error=f"construction de l'ordre impossible (non envoye): {e!r}")
+        try:
+            resp = await asyncio.to_thread(self.client.post_order, signed, OrderType.FOK)
+        except Exception as e:
+            return classify_exception(e)
+        return parse_post_response(resp, req.side, req)
+
+    async def lookup_order(self, exchange_order_id: str) -> SubmitResult | None:
+        """Etat reel d'un ordre connu. None si la requete echoue (l'incertitude demeure)."""
+        try:
+            o = await asyncio.to_thread(self.client.get_order, exchange_order_id)
+        except Exception as e:
+            log.warning("Lecture de l'ordre %s impossible: %s", exchange_order_id, e)
             return None
-        price = limit
-        try:  # BUY: making=USDC, taking=shares. SELL: making=shares, taking=USDC.
-            making, taking = float(resp["makingAmount"]), float(resp["takingAmount"])
-            if making > 0 and taking > 0:
-                price = making / taking if side == BUY else taking / making
-                shares = taking if side == BUY else making
-        except (KeyError, TypeError, ValueError):
-            pass
-        log.info("ORDRE EXECUTE %s %.2f shares @ %.4f (id %s)", side, shares, price, resp.get("orderID"))
-        return Fill(token_id, side, price, shares, resp.get("orderID", ""), simulated=False)
+        if not isinstance(o, dict) or not o:
+            return None
+        status = str(o.get("status", "")).lower()
+        matched = float(o.get("size_matched") or 0)
+        price = float(o.get("price") or 0)
+        if status in ("live", "open"):
+            return SubmitResult("unknown", matched, price, exchange_order_id=exchange_order_id, raw=o,
+                                error="ordre au carnet")
+        if matched > 0:
+            return SubmitResult("filled", matched, price, exchange_order_id=exchange_order_id, raw=o)
+        if status in ("canceled", "cancelled", "unmatched", "expired"):
+            return SubmitResult("rejected", exchange_order_id=exchange_order_id, raw=o, error=status)
+        return None
+
+    async def cancel(self, exchange_order_id: str) -> None:
+        await asyncio.to_thread(self.client.cancel, exchange_order_id)
+
+    async def positions(self) -> dict[str, float] | None:
+        """Positions du compte selon la Data API. None si indisponible (=> exposition inconnue)."""
+        try:
+            resp = await self.http.get(f"{DATA_API}/positions",
+                                       params={"user": self.account, "sizeThreshold": 0, "limit": 500})
+            resp.raise_for_status()
+            return {str(p["asset"]): float(p["size"]) for p in resp.json() if float(p.get("size") or 0) > 0}
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
+            log.error("Positions du compte indisponibles: %s", e)
+            return None
+
+    async def cancel_all(self) -> None:
+        await asyncio.to_thread(self.client.cancel_all)

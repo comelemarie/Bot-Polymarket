@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from core.config import BotConfig, DiscoveryConfig, Secrets
+from core.config import DiscoveryConfig
 from core.models import Market
 from ingestion.market_discovery import (
     KeywordGenerator,
@@ -12,7 +12,6 @@ from ingestion.market_discovery import (
     phrase_to_regex,
     select_markets,
 )
-from ingestion.polymarket_ws import PolymarketFeed
 
 NOW = datetime(2026, 10, 20, tzinfo=timezone.utc)
 
@@ -76,39 +75,47 @@ async def test_keyword_generator_caches(tmp_path, monkeypatch):
     assert calls == [["a", "fails"], ["fails"]]  # "a" vient du cache, "fails" est retente
 
 
-def test_feed_set_markets_resubscribes():
+def test_market_state_set_markets_keeps_books():
+    from core.config import MarketDataConfig
+    from ingestion.market_state import MarketState
+
     m1 = Market("a", "", "", "", "", "a-y", "a-n", 0.01, False, 0, [])
     m2 = Market("b", "", "", "", "", "b-y", "b-n", 0.01, False, 0, [])
-    feed = PolymarketFeed({"a": m1}, 60)
-    feed.books["a-y"].bids = {0.5: 10}
-    feed._resubscribe.clear()
-    feed.set_markets({"a": m1, "b": m2})
-    assert feed._resubscribe.is_set()
-    assert feed.books["a-y"].bids == {0.5: 10}  # carnet existant conserve
-    assert set(feed.history) == {"a", "b"}
-    feed._resubscribe.clear()
-    feed.set_markets({"a": m1, "b": m2})
-    assert not feed._resubscribe.is_set()  # rien n'a change
+    st = MarketState(MarketDataConfig(), 60, 0.1)
+    st.set_markets({"a": m1})
+    st.books["a-y"].bids = {0.5: 10}
+    added, removed = st.set_markets({"a": m1, "b": m2})
+    assert added == {"b-y", "b-n"} and not removed
+    assert st.books["a-y"].bids == {0.5: 10}  # carnet existant conserve
+    assert set(st.history) == {"a", "b"}
+    assert st.set_markets({"a": m1, "b": m2}) == (set(), set())  # rien n'a change
+
+
+def test_parse_market_event_and_tags():
+    from ingestion.polymarket_ws import parse_market
+
+    row = gamma_market("x", orderMinSize=10, events=[{"id": 42, "slug": "ev", "tags": [{"slug": "Politics"}]}])
+    m = parse_market(row, [])
+    assert (m.event_id, m.event_slug, m.tags, m.min_order_size) == ("42", "ev", ["politics"], 10.0)
+    assert parse_market({**row, "acceptingOrders": False}, []) is None
 
 
 @pytest.mark.asyncio
 async def test_refresh_keeps_markets_with_open_positions(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    from main import Bot
+    from tests.helpers import make_bot
 
-    cfg = BotConfig.model_validate({"discovery": {"enabled": True}})
-    bot = Bot(cfg, Secrets(anthropic_api_key="t", x_bearer_token=None, polygon_private_key=None,
-                           signature_type=1, funder_address=None), {})
+    bot, clock, _ = make_bot(tmp_path, {"discovery": {"enabled": True}})
+    bot.keyword_gen = object()  # non nul: active la decouverte dans refresh_markets
     held = Market("held", "", "", "", "", "h-y", "h-n", 0.01, False, 0, [])
     new = Market("new", "", "", "", "", "n-y", "n-n", 0.01, False, 0, ["x"])
     bot.set_markets({"held": held})
-    bot.state.add_fill("held", "h-y", "YES", 0.5, 10)
+    bot.portfolio.add_fill(market_slug="held", token_id="h-y", outcome="YES", shares=10, cost_usdc=5, ts=clock.now())
 
     async def fake_discover(cfg, gen):
         return {"new": new}
 
-    monkeypatch.setattr("main.discover_markets", fake_discover)
+    monkeypatch.setattr("ingestion.market_discovery.discover_markets", fake_discover)
     await bot.refresh_markets()
     assert set(bot.markets) == {"held", "new"}
-    assert set(bot.triggers.markets) == {"held", "new"}
-    assert "n-y" in bot.feed.books
+    assert set(bot.triggers.patterns) == {"held", "new"}
+    assert "n-y" in bot.state.books

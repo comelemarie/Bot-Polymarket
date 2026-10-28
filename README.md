@@ -1,208 +1,115 @@
 # Bot-Polymarket
 
-Bot de trading Polymarket piloté par l'actualité : il surveille X et des flux RSS, ne sollicite Claude
-que lorsqu'une actualité pertinente coïncide avec un mouvement de prix, puis laisse un moteur de risque
-déterministe décider de la taille de la position.
+Bot de trading événementiel sur Polymarket. Il détecte des actualités susceptibles de modifier la
+probabilité d'un événement, les confronte au carnet d'ordres, fait estimer une probabilité par Claude,
+puis vérifie de façon déterministe qu'un avantage net subsiste après frais. Il ne passe un ordre que
+dans les limites d'un moteur de risque codé en dur.
 
-> **Le bot démarre en mode papier (`"dry_run": true`).** Aucun ordre réel n'est envoyé tant que tu
-> n'as pas passé ce flag à `false`. Laisse-le tourner plusieurs jours en papier et lis
-> `logs/decisions.jsonl` avant d'engager de l'argent.
+> **Mode par défaut : PAPER.** Aucun ordre réel n'est envoyé. Le mode réel exige quatre conditions
+> indépendantes (`docs/LIVE.md`).
+>
+> **Rien ne démontre aujourd'hui que cette stratégie est rentable.** Les tests prouvent que le code
+> fait ce qu'il doit faire, pas qu'il gagne de l'argent. La rentabilité se mesure hors échantillon
+> (`docs/VALIDATION.md`).
 
 ## Architecture
 
 ```
-            ┌────────────────────┐   ┌──────────────────────┐
-  X API ───►│ twitter_stream.py  │   │  polymarket_ws.py    │◄─── WebSocket CLOB
-  RSS   ───►│ rss_feed.py        │   │  carnets YES/NO      │     (book, price_change)
-            └─────────┬──────────┘   └──────────┬───────────┘
-                      │ NewsItem                │ variation de prix
-                      ▼                         ▼
-                  ┌──────────────────────────────────┐
-                  │ news_filter.py (local, gratuit)  │  mot-clé ET variation ≥ seuil
-                  │ fenêtre + cooldown + dédoublonnage│  dans la même fenêtre
-                  └────────────────┬─────────────────┘
-                                   │ Trigger (rare)
-                                   ▼
-                  ┌──────────────────────────────────┐
-                  │ claude_analyst.py                │  JSON strict (structured outputs)
-                  │ → P(YES), confiance, déjà pricé ?│  budget d'appels/heure et /jour
-                  └────────────────┬─────────────────┘
-                                   ▼
-                  ┌──────────────────────────────────┐
-                  │ risk_manager.py (sans IA)        │  Kelly fractionné + plafonds
-                  └────────────────┬─────────────────┘
-                                   ▼
-                  ┌──────────────────────────────────┐
-                  │ polygon_clob.py                  │  ordres FOK via py-clob-client
-                  │ + surveillance stop-loss         │  (ou simulation papier)
-                  └──────────────────────────────────┘
+ X API / RSS ──► rss_feed / twitter_stream ──► news_normalizer ──┐  (dédoublonnage multi-sources,
+                                                                │   publication ≠ réception)
+ WebSocket CLOB ──► polymarket_ws ──► market_state ─────────────┤  (carnets synchronisés et validés)
+                                                                ▼
+                                  news_filter (local, 3 voies, état persistant)
+                       actualité seule │ actualité + mouvement │ mouvement seul → anomalie, AUCUN ordre
+                                                                ▼
+                                  claude_analyst  → probabilité + intervalle + abstention
+                                  (JSON validé, budget et coût plafonnés, cache, journal complet)
+                                                                ▼  après la latence réelle du modèle
+                                  edge_calculator → avantage net (carnet réel, frais, slippage, borne prudente)
+                                                                ▼
+                                  risk_manager    → Kelly fractionné + plafonds + coupe-circuits
+                                                                ▼
+                                  execution_engine → intention en base, vérification finale, FOK,
+                                  paper_broker | polygon_clob     réconciliation des ordres incertains
+                                                                ▼
+                       SQLite (state/bot.db) : actualité → événement → analyse → décision → ordre → résultat
+                       recorder (data/recordings) ──► backtest/replay ──► analytics/performance_tracker
 ```
 
-```
-Bot-Polymarket/
-├── .env.example            # Clés API (Anthropic, X, clé privée Polygon) → copier en .env
-├── config.json             # Limites de risque, budget Claude, sources, découverte des marchés
-├── main.py                 # Boucle asyncio principale + tâches supervisées
-├── core/                   # Config, modèles, état persistant (positions, PnL du jour)
-├── ingestion/
-│   ├── twitter_stream.py   # X API v2 : polling (recherche récente) ou filtered stream
-│   ├── rss_feed.py         # Flux RSS d'agences (gratuit, complément de X)
-│   ├── news_filter.py      # Filtre local : mot-clé + variation de prix
-│   ├── market_discovery.py # Sélection automatique des marchés + mots-clés générés par Haiku
-│   └── polymarket_ws.py    # Métadonnées Gamma + carnet d'ordres temps réel
-├── brain/
-│   └── claude_analyst.py   # Requête structurée à l'API Anthropic
-├── execution/
-│   ├── risk_manager.py     # Kelly, plafonds, stop-loss, coupe-circuit
-│   └── polygon_clob.py     # Envoi des ordres (py-clob-client) / simulation papier
-├── deploy/                 # LaunchDaemon + script de configuration du Mac mini
-└── tests/                  # pytest (moteur de risque, filtre, pipeline de bout en bout)
-```
-
-## Ce qui a été ajusté par rapport au plan initial
-
-| Plan initial | Choix retenu | Pourquoi |
-|---|---|---|
-| Claude 3.5 / 3.7 Sonnet | `claude-sonnet-5-5` (modifiable dans `config.json`) | Les modèles 3.x sont retirés. |
-| JSON via `tool_choice` forcé | Structured outputs (`messages.parse` + schéma Pydantic) | Le `tool_choice` forcé renvoie une erreur 400 sur les modèles actuels ; les structured outputs garantissent un JSON conforme. |
-| Scraping X via Playwright | API officielle X (polling ou stream) + RSS | Le scraping casse souvent et fait bannir les comptes. Le RSS donne une source gratuite et stable. |
-| SpaCy / mini-modèle | Regex par marché | Suffisant pour démarrer, sans dépendance lourde. Les mots-clés de `config.json` sont des regex insensibles à la casse. |
-| Kelly sur P_Claude brute | Kelly sur une probabilité **ramenée vers le marché** selon la confiance de Claude | Limite l'effet d'une estimation trop sûre d'elle. |
-| — | Coupe-circuit journalier, contrôle du spread, plafond sur la profondeur du carnet, ordres FOK, mode papier | Garde-fous supplémentaires indispensables en réel. |
-
-**À savoir sur le déclencheur « mot-clé + variation de prix »** : il économise beaucoup d'appels, mais
-quand le prix a déjà bougé, une partie de l'edge a disparu. Mets `"require_price_move": false` pour
-appeler Claude dès qu'un mot-clé apparaît, ce qui sera plus rapide mais plus cher.
-
-## Sélection automatique des marchés
-
-Avec `discovery.enabled: true` (réglage par défaut), le bot choisit seul les marchés à surveiller.
-Il refait cette sélection toutes les heures (`refresh_interval_s`).
-
-1. **Lecture** des events actifs sur l'API Polymarket (Gamma), triés par volume 24 h
-   (jusqu'à `max_pages` × 100 events).
-2. **Filtres**. Un marché est retenu s'il :
-   - est un marché YES/NO ouvert aux ordres ;
-   - a une liquidité ≥ `min_liquidity_usdc` et un volume 24 h ≥ `min_volume_24h_usdc` ;
-   - se termine entre `min_hours_to_end` heures et `max_days_to_end` jours ;
-   - n'est pas exclu par `exclude_tags`, `exclude_question_patterns` ou `exclude_slugs`.
-
-   Si `include_tags` n'est pas vide, seules ces catégories sont gardées (ex. `["politics", "crypto"]`).
-   On garde ensuite les `max_markets` plus actifs.
-3. **Mots-clés** : pour chaque nouveau marché, Claude Haiku propose 3 à 8 expressions qu'on
-   retrouverait dans un titre d'actualité (noms, organisations, termes précis). Les marchés sont
-   traités par lots de 25 et le résultat est mis en cache dans `state/keywords_cache.json` : on ne
-   paie qu'une fois par marché, quelques centimes pour 150 marchés. Si l'appel échoue, le bot utilise
-   les noms propres de la question et retente au rafraîchissement suivant.
-
-Par défaut, deux types de marchés sont exclus :
-- **le sport** (`exclude_tags: ["sports"]`) : pendant un match, le prix bouge en continu, ce qui
-  satisferait sans cesse la condition « variation de prix » ;
-- **les marchés crypto « Up or Down »** à très courte échéance, qui réagissent au cours et non à
-  l'actualité.
-
-Retire ces exclusions si tu veux quand même ces marchés.
-
-Un marché où tu as une position ouverte reste toujours surveillé (pour le stop-loss), même s'il ne
-passe plus les filtres. La liste manuelle `markets` reste disponible : ses marchés s'ajoutent à la
-sélection automatique avec tes propres mots-clés et notes.
-
-Pour vérifier la sélection et les mots-clés générés, regarde les lignes `Decouverte:` et
-`Marches surveilles:` dans `logs/bot.log`, ainsi que le fichier `state/keywords_cache.json`.
-
-## Moteur de risque
-
-Pour un contrat acheté au prix `p` (meilleur ask) avec une probabilité estimée `q` :
-
-```
-q_ajustée = mid_marché + confiance × (P_Claude − mid_marché)
-edge      = q_ajustée − p                  (calculé pour YES et pour NO, on garde le meilleur)
-Kelly     = (q_ajustée − p) / (1 − p)
-mise      = min( kelly_fraction × Kelly × capital,
-                 5 % du capital − exposition déjà prise sur ce marché,
-                 40 % du capital − exposition totale,
-                 USDC disponibles − réserve minimale,
-                 50 % de la profondeur du carnet jusqu'au prix limite )
-prix limite = min(ask + slippage max, q_ajustée − edge minimum), arrondi au tick
-```
-
-Aucun trade n'est passé si l'une de ces conditions est vraie : actualité non pertinente, information
-déjà intégrée au prix, confiance < `min_confidence`, edge < `min_edge`, spread > `max_spread`, ordre
-< `min_order_usdc`, ou coupe-circuit actif (perte du jour > `max_daily_loss_pct`).
-
-Sortie : stop-loss si le meilleur bid tombe à `prix_entrée × (1 − stop_loss_pct)`, take-profit
-si le bid dépasse `take_profit_price`. La vérification a lieu toutes les `position_check_interval_s`.
-
-Tout est journalisé dans `logs/decisions.jsonl` : actualités, réponse de Claude, verdict du risque,
-exécutions et sorties.
+| Module | Rôle |
+|---|---|
+| `core/config.py` | Configuration validée (clé inconnue = erreur), modes, secrets |
+| `core/modes.py` | Déverrouillage du mode réel (4 conditions + bornes de risque) |
+| `core/store.py`, `core/state.py` | Persistance SQLite, portefeuille, coupe-circuits persistants |
+| `core/clock.py` | Horloge réelle ou simulée (replay sans fuite du futur) |
+| `ingestion/news_normalizer.py` | Empreintes, similarité, URL canoniques, fiabilité des sources |
+| `ingestion/market_state.py` | Carnets : instantané, deltas, contrôle des meilleurs prix serveur, désynchronisation |
+| `ingestion/polymarket_ws.py` | Connexions WebSocket, resynchronisation, métadonnées Gamma |
+| `ingestion/clob_rest.py` | Carnet REST avant ordre, taux de frais, résolutions |
+| `ingestion/news_filter.py` | Détection locale à 3 voies |
+| `ingestion/market_discovery.py` | Sélection automatique des marchés et mots-clés (Haiku) |
+| `ingestion/recorder.py` | Enregistrement brut des flux pour le replay |
+| `brain/claude_analyst.py` | Analyse structurée, validation, budget, cache |
+| `execution/edge_calculator.py` | Avantage net, VWAP, frais, Kelly |
+| `execution/risk_manager.py` | Décision d'entrée et de taille, règles de sortie |
+| `execution/execution_engine.py` | Cycle de vie des ordres, idempotence, réconciliation, arrêt d'urgence |
+| `execution/paper_broker.py`, `execution/polygon_clob.py` | Courtier simulé, courtier réel |
+| `bot.py`, `main.py` | Orchestration, CLI |
+| `backtest/replay.py` | Replay chronologique |
+| `analytics/performance_tracker.py` | PnL, drawdown, Brier, calibration, abstentions |
 
 ## Installation
 
+Python 3.10 ou plus récent.
+
 ```bash
+git clone https://github.com/comelemarie/Bot-Polymarket.git && cd Bot-Polymarket
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env && chmod 600 .env   # puis remplir
-python -m pytest                          # 20 tests
+cp .env.example .env && chmod 600 .env    # renseigner ANTHROPIC_API_KEY
+python -m pytest                           # 87 tests
 ```
 
-1. **Marchés** : la sélection automatique est active par défaut (voir plus haut). Tu peux aussi
-   ajouter des marchés à la main dans `config.json → markets`, avec leur `slug` et leurs mots-clés.
-   Le slug est le dernier segment de l'URL : `polymarket.com/event/<event>/<slug-du-marché>`, ou
-   `polymarket.com/event/<slug>` si l'event ne contient qu'un marché.
-2. **Sources** : le RSS est actif par défaut (Google News, BBC, NYT, CNBC, Al Jazeera, CoinDesk).
-   Plus tu surveilles de marchés, plus la couverture d'actualité compte. Pour X, mets `news.x.enabled` à `true`, renseigne
-   `X_BEARER_TOKEN` et choisis le mode `poll` (tiers d'API d'entrée de gamme) ou `stream` (filtered
-   stream, qui demande un accès supérieur).
-3. **Lancer** : `python main.py`.
-
-### Passer en réel
-
-1. Wallet Polygon approvisionné en USDC, avec les allowances déjà accordées sur Polymarket.
-   Le plus simple est d'avoir déjà tradé une fois depuis l'interface web.
-2. Dans `.env` : `POLYGON_PRIVATE_KEY`, `POLYMARKET_SIGNATURE_TYPE` (0 = EOA/MetaMask,
-   1 = compte email/Magic, 2 = proxy navigateur) et `POLYMARKET_FUNDER_ADDRESS` (l'adresse du proxy
-   wallet affichée sur Polymarket).
-3. Commence avec un capital réduit et `max_exposure_per_market_pct` bas, puis `"dry_run": false`.
-4. Vérifie la première exécution dans `logs/bot.log` et sur polymarket.com.
-
-## Mac mini 24/7
+## Lancement en simulation (PAPER)
 
 ```bash
-./deploy/setup_macmini.sh
+python main.py
+python main.py --status                    # dans un autre terminal
+python -m analytics.performance_tracker    # rapport
 ```
 
-Le script :
-- désactive la veille et active le redémarrage automatique après une coupure de courant
-  (`pmset autorestart 1`) ou un gel du système ;
-- crée le venv et installe les dépendances ;
-- installe un **LaunchDaemon** (`/Library/LaunchDaemons/com.polybot.plist`). Le bot démarre au boot
-  sans qu'une session soit ouverte, et launchd le relance s'il s'arrête (`KeepAlive`, au plus une
-  relance toutes les 30 s).
+Dans les premières minutes, le bot écrit `Decouverte: … marches retenus`, `Abonnement WebSocket: …`
+et `MODE PAPER`. Toutes les décisions, y compris les refus et leurs motifs, sont dans la table
+`decisions` :
 
-Le bot a aussi sa propre résilience : chaque composant (WebSocket, X, RSS, surveillance des
-positions) est supervisé et relancé seul en cas d'erreur. Le WebSocket se reconnecte avec un backoff
-exponentiel. L'état (positions, PnL du jour, solde papier) est écrit de façon atomique dans
-`state/portfolio.json` et survit aux redémarrages. `state/heartbeat` contient le timestamp du dernier
-battement (toutes les 5 min) et peut servir à une supervision externe.
+```bash
+sqlite3 state/bot.db "SELECT created_at, market_slug, action, reason FROM decisions ORDER BY created_at DESC LIMIT 20"
+```
 
-**Points d'attention sur le Mac :**
-- **FileVault** : s'il est actif, le Mac reste bloqué sur l'écran de déverrouillage après une coupure
-  de courant, et le bot ne redémarre pas. Désactive-le, ou accepte de devoir intervenir à la main.
-- **Mises à jour macOS** : désactive l'installation automatique, qui peut redémarrer la machine.
-- Un onduleur (UPS) et une connexion Ethernet valent mieux que le Wi-Fi.
+Sur un Mac mini 24 h/24 : `./deploy/setup_macmini.sh` (service launchd, redémarrage automatique).
 
-## Sécurité et limites
+## Replay et validation
 
-- **Injection via les tweets** : un tweet peut contenir des instructions destinées à Claude. Le prompt
-  traite les actualités comme des données non fiables, et surtout les plafonds de risque codés en dur
-  bornent les dégâts quelle que soit la réponse de Claude.
-- **Clé privée** : `.env` est exclu de git et passé en `chmod 600`. Utilise un wallet dédié au bot,
-  avec seulement le capital alloué.
-- **Coût Claude** : plafonné par `max_calls_per_hour` / `max_calls_per_day` (30 / 300 par défaut).
-  Un appel d'analyse coûte de l'ordre de 1 à 5 centimes de dollar, soit au pire quelques dollars à
-  une quinzaine de dollars par jour avec ces plafonds. La génération des mots-clés (Haiku) est
-  négligeable.
-- **Accès à Polymarket** : la plateforme bloque certains pays (dont la France) pour le trading. Vérifie
-  ta situation avant de passer en réel.
-- Le mode papier simule les exécutions contre le carnet réel (FOK), mais pas l'impact de tes propres
-  ordres ni la latence d'exécution.
+```bash
+python -m backtest.replay --from 2026-11-01 --to 2026-11-08 --out state/replay.db
+python -m analytics.performance_tracker --db state/replay.db --outcomes-db state/bot.db
+```
+
+## Documentation
+
+- `docs/AUDIT.md` : diagnostic de la version précédente et plan suivi.
+- `docs/CONFIGURATION.md` : chaque paramètre, sa justification et sa méthode de calibration.
+- `docs/VALIDATION.md` : les 4 étapes avant l'argent réel, les biais et les limites statistiques.
+- `docs/LIVE.md` : passage au réel et points non vérifiés en production.
+- `docs/OPERATIONS.md` : arrêt d'urgence, coupe-circuits, redémarrages, données.
+
+## Risques et limites
+
+- Le modèle peut se tromper avec assurance. Sa confiance n'est pas une probabilité calibrée. Seule la
+  comparaison de son score de Brier avec celui du marché, sur des issues réelles, dira s'il apporte de
+  l'information.
+- Un stop-loss ne garantit pas le prix de sortie quand le carnet est fin ou que le prix saute.
+- Le mode papier et le replay ignorent l'impact de nos ordres et la file d'attente : leurs résultats
+  sont optimistes.
+- Plusieurs formats d'API n'ont pas pu être vérifiés contre la production (liste dans `docs/LIVE.md`).
+- Polymarket bloque le trading dans certains pays, dont la France. La lecture des données est publique.

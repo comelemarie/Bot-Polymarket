@@ -93,7 +93,8 @@ def select_markets(events: list[dict], cfg: DiscoveryConfig, now: datetime | Non
             question = m.get("question", "")
             if any(p.search(question) for p in excluded_q):
                 continue
-            selected[slug] = {**m, "_event_title": ev.get("title", ""), "_tags": sorted(tags)}
+            selected[slug] = {**m, "_event_title": ev.get("title", ""), "_tags": sorted(tags),
+                              "_event": {"id": ev.get("id", ""), "slug": ev.get("slug", "")}}
 
     rows = sorted(selected.values(), key=lambda m: _float(m, "volume24hr", "volume24hrClob"), reverse=True)
     return rows[: cfg.max_markets]
@@ -231,7 +232,7 @@ async def discover_markets(cfg: DiscoveryConfig, generator: KeywordGenerator) ->
         kw = [phrase_to_regex(p) for p in phrases.get(row["slug"], []) if p.strip()]
         if not kw:
             continue
-        market = parse_market(row, kw)
+        market = parse_market(row, kw, event=row.get("_event"), tags=row.get("_tags"))
         if market:
             markets[market.slug] = market
     log.info("Decouverte: %d events lus, %d marches retenus, %d surveilles", len(events), len(rows), len(markets))

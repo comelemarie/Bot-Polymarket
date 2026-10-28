@@ -1,23 +1,36 @@
-"""Metadonnees des marches (API Gamma) + carnet d'ordres temps reel (WebSocket CLOB)."""
+"""Metadonnees des marches (API Gamma) + flux WebSocket du carnet d'ordres (CLOB, canal "market").
+
+Protocole (documentation Polymarket, format price_change en vigueur depuis le 15/09/2025):
+  abonnement  {"assets_ids": [...], "type": "market", "custom_feature_enabled": true}
+  evenements  book (instantane), price_change (price_changes[] avec best_bid/best_ask/hash par entree),
+              tick_size_change, last_trade_price, et avec custom_feature_enabled: best_bid_ask,
+              new_market, market_resolved.
+  maintien    envoi de "PING" toutes les 10 s.
+Il n'y a pas de numero de sequence: les messages perdus sont detectes par comparaison du carnet
+reconstruit avec les meilleurs prix annonces, et corriges par reconnexion (nouvel instantane).
+"""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import time
-from collections import deque
 from typing import Awaitable, Callable
 
 import httpx
 import websockets
 
-from core.config import MarketWatch
-from core.models import Market, OrderBook
+from core.clock import Clock
+from core.config import MarketDataConfig, MarketWatch
+from core.models import Market
+from ingestion.market_state import MarketState
 
 log = logging.getLogger(__name__)
 
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+Recorder = Callable[[str, object, float], None]
+UpdateCallback = Callable[[set[str], float], Awaitable[None]]
 
 
 def _json_list(value) -> list:
@@ -27,11 +40,11 @@ def _json_list(value) -> list:
     return list(value or [])
 
 
-def parse_market(m: dict, keywords: list[str], notes: str = "") -> Market | None:
+def parse_market(m: dict, keywords: list[str], notes: str = "", event: dict | None = None,
+                 tags: list[str] | None = None) -> Market | None:
     """Construit un Market depuis une ligne Gamma, ou None si non tradable (ferme, non binaire...)."""
     slug = m.get("slug", "?")
     if m.get("closed") or not m.get("active", True) or m.get("acceptingOrders") is False:
-        log.debug("Marche ferme/inactif ignore: %s", slug)
         return None
     try:
         outcomes = [o.lower() for o in _json_list(m.get("outcomes"))]
@@ -41,6 +54,11 @@ def parse_market(m: dict, keywords: list[str], notes: str = "") -> Market | None
     if len(tokens) != 2 or outcomes not in (["yes", "no"], ["no", "yes"]):
         log.debug("Marche non binaire YES/NO ignore: %s (%s)", slug, outcomes)
         return None
+    if event is None:
+        events = m.get("events") or []
+        event = events[0] if events and isinstance(events[0], dict) else {}
+    if tags is None:
+        tags = sorted({str(t.get("slug", "")).lower() for t in (event.get("tags") or []) if isinstance(t, dict)} - {""})
     yes_idx = outcomes.index("yes")
     return Market(
         slug=slug,
@@ -55,11 +73,16 @@ def parse_market(m: dict, keywords: list[str], notes: str = "") -> Market | None
         liquidity_usdc=float(m.get("liquidityNum") or m.get("liquidity") or 0),
         keywords=keywords,
         notes=notes,
+        event_id=str(event.get("id", "")),
+        event_slug=str(event.get("slug", "")),
+        tags=tags,
+        min_order_size=float(m.get("orderMinSize") or 5),
+        accepting_orders=m.get("acceptingOrders", True) is not False,
     )
 
 
 async def load_markets(watchlist: list[MarketWatch]) -> dict[str, Market]:
-    """Resout chaque slug de la whitelist manuelle via l'API Gamma."""
+    """Resout chaque slug de la liste manuelle via l'API Gamma."""
     markets: dict[str, Market] = {}
     async with httpx.AsyncClient(timeout=20) as http:
         for watch in watchlist:
@@ -78,89 +101,58 @@ async def load_markets(watchlist: list[MarketWatch]) -> dict[str, Market]:
     return markets
 
 
-class PriceHistory:
-    """Historique glissant du mid YES pour detecter une variation de prix."""
-
-    def __init__(self, window_s: float):
-        self.window_s = window_s
-        self.points: deque[tuple[float, float]] = deque()
-
-    def add(self, mid: float, ts: float | None = None) -> None:
-        ts = ts if ts is not None else time.time()
-        self.points.append((ts, mid))
-        while self.points and ts - self.points[0][0] > self.window_s:
-            self.points.popleft()
-
-    def move(self) -> float:
-        """Amplitude max-min sur la fenetre (en points de probabilite)."""
-        if len(self.points) < 2:
-            return 0.0
-        mids = [p for _, p in self.points]
-        return max(mids) - min(mids)
-
-
-PriceCallback = Callable[[Market], Awaitable[None]]
+def parse_raw(raw: str | bytes) -> list[dict] | None:
+    if raw in ("PONG", b"PONG"):
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    events = data if isinstance(data, list) else [data]
+    return [e for e in events if isinstance(e, dict)]
 
 
 class PolymarketFeed:
-    """Maintient les carnets YES/NO des marches surveilles.
-
-    La liste des marches peut changer en cours de route (decouverte automatique):
-    `set_markets` met a jour les carnets et relance les abonnements WebSocket.
-    Les tokens sont repartis sur plusieurs connexions de `ASSETS_PER_CONNECTION` max.
-    """
+    """Connexions WebSocket (par paquets de tokens) alimentant un MarketState."""
 
     ASSETS_PER_CONNECTION = 200
 
-    def __init__(self, markets: dict[str, Market], price_window_s: float):
-        self.price_window_s = price_window_s
-        self.markets: dict[str, Market] = {}
-        self.books: dict[str, OrderBook] = {}
-        self.history: dict[str, PriceHistory] = {}
-        self._by_asset: dict[str, Market] = {}
+    def __init__(self, state: MarketState, cfg: MarketDataConfig, clock: Clock,
+                 on_update: UpdateCallback | None = None, recorder: Recorder | None = None):
+        self.state = state
+        self.cfg = cfg
+        self.clock = clock
+        self.on_update = on_update
+        self.recorder = recorder
         self._resubscribe = asyncio.Event()
-        self.callbacks: list[PriceCallback] = []
-        self.set_markets(markets)
 
-    def set_markets(self, markets: dict[str, Market]) -> None:
-        old_assets = set(self.books)
-        self.markets = dict(markets)
-        self._by_asset = {}
-        books: dict[str, OrderBook] = {}
-        for m in self.markets.values():
-            for tok in (m.yes_token_id, m.no_token_id):
-                books[tok] = self.books.get(tok) or OrderBook(tok)
-                self._by_asset[tok] = m
-        self.books = books
-        self.history = {
-            slug: self.history.get(slug) or PriceHistory(self.price_window_s) for slug in self.markets
-        }
-        if set(self.books) != old_assets:
-            self._resubscribe.set()
+    def request_resubscribe(self) -> None:
+        self._resubscribe.set()
 
-    def on_price(self, cb: PriceCallback) -> None:
-        self.callbacks.append(cb)
-
-    def book(self, token_id: str) -> OrderBook:
-        return self.books[token_id]
-
-    def yes_mid(self, market: Market) -> float | None:
-        return self.books[market.yes_token_id].mid
-
-    def is_fresh(self, market: Market, max_age_s: float = 120) -> bool:
-        now = time.time()
-        books = [self.books.get(t) for t in (market.yes_token_id, market.no_token_id)]
-        return all(b is not None and now - b.updated_at < max_age_s for b in books)
+    async def handle_raw(self, raw: str | bytes, ts: float) -> set[str]:
+        """Applique un message brut. Retourne les tokens desynchronises."""
+        events = parse_raw(raw)
+        if events is None:
+            return set()
+        if self.recorder:
+            self.recorder("ws", raw if isinstance(raw, str) else raw.decode(), ts)
+        touched, desynced = set(), set()
+        for ev in events:
+            t, d = self.state.apply_event(ev, ts)
+            touched |= t
+            desynced |= d
+        if touched and self.on_update:
+            await self.on_update(touched, ts)
+        return desynced
 
     async def run(self) -> None:
-        """Ouvre une connexion par paquet de tokens; tout est relance quand la liste change."""
         while True:
             self._resubscribe.clear()
-            assets = list(self.books)
+            assets = list(self.state.books)
             chunks = [assets[i:i + self.ASSETS_PER_CONNECTION]
                       for i in range(0, len(assets), self.ASSETS_PER_CONNECTION)]
             log.info("Abonnement WebSocket: %d marches, %d tokens, %d connexion(s)",
-                     len(self.markets), len(assets), len(chunks))
+                     len(self.state.markets), len(assets), len(chunks))
             tasks = [asyncio.create_task(self._connection(i, chunk)) for i, chunk in enumerate(chunks)]
             try:
                 await self._resubscribe.wait()
@@ -170,84 +162,51 @@ class PolymarketFeed:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _connection(self, idx: int, assets: list[str]) -> None:
-        """Une connexion WebSocket avec reconnexion automatique."""
-        backoff = 1
+        backoff = 1.0
         while True:
+            connected_at = None
+            reason = ""
             try:
-                async with websockets.connect(WS_URL, ping_interval=None, max_size=2**24) as ws:
-                    await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
-                    log.debug("WebSocket #%d connecte (%d tokens)", idx, len(assets))
-                    backoff = 1
+                async with websockets.connect(WS_URL, ping_interval=None, max_size=2**24, open_timeout=20) as ws:
+                    connected_at = self.clock.now()
+                    self.state.on_connected(assets)
+                    if self.recorder:
+                        self.recorder("ws_connect", assets, connected_at)
+                    await ws.send(json.dumps({"assets_ids": assets, "type": "market", "custom_feature_enabled": True}))
                     pinger = asyncio.create_task(self._ping(ws))
                     try:
-                        async for raw in ws:
-                            await self._handle(raw)
+                        reason = await self._read(ws, connected_at)
                     finally:
                         pinger.cancel()
             except asyncio.CancelledError:
                 raise
-            except Exception as e:  # reseau, deconnexion serveur...
-                log.warning("WebSocket #%d coupe (%s), reconnexion dans %ss", idx, e, backoff)
+            except Exception as e:
+                reason = f"erreur: {e}"
+            finally:
+                now = self.clock.now()
+                self.state.on_disconnected(assets)
+                if self.recorder:
+                    self.recorder("ws_disconnect", assets, now)
+            # Une connexion qui tombe vite (ou se desynchronise aussitot) espace les tentatives.
+            stable = connected_at is not None and self.clock.now() - connected_at > 60
+            backoff = 1.0 if stable else min(backoff * 2, 60)
+            log.warning("WebSocket #%d ferme (%s), reconnexion dans %.0fs", idx, reason, backoff)
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+
+    async def _read(self, ws, connected_at: float) -> str:
+        while True:
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=self.cfg.max_silence_s)
+            except asyncio.TimeoutError:
+                return f"silence > {self.cfg.max_silence_s:.0f}s"
+            desynced = await self.handle_raw(raw, self.clock.now())
+            if desynced:
+                return f"resynchronisation de {len(desynced)} carnet(s)"
+            if self.clock.now() - connected_at > self.cfg.resync_interval_s:
+                return "resynchronisation periodique"
 
     async def _ping(self, ws) -> None:
         while True:
             await asyncio.sleep(10)
             await ws.send("PING")
 
-    async def _handle(self, raw: str | bytes) -> None:
-        if raw in ("PONG", b"PONG"):
-            return
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            return
-        events = data if isinstance(data, list) else [data]
-        touched: set[str] = set()
-        for ev in events:
-            touched |= self._apply(ev)
-        for slug in touched:
-            market = self.markets.get(slug)
-            if market is None:
-                continue
-            mid = self.yes_mid(market)
-            if mid is not None:
-                self.history[slug].add(mid)
-            for cb in self.callbacks:
-                await cb(market)
-
-    def _apply(self, ev: dict) -> set[str]:
-        """Applique un evenement au carnet; retourne les slugs modifies."""
-        etype = ev.get("event_type")
-        now = time.time()
-        touched: set[str] = set()
-        if etype == "book":
-            book = self.books.get(ev.get("asset_id", ""))
-            if book is None:
-                return touched
-            bids = ev.get("bids") or ev.get("buys") or []
-            asks = ev.get("asks") or ev.get("sells") or []
-            book.bids = {float(l["price"]): float(l["size"]) for l in bids if float(l["size"]) > 0}
-            book.asks = {float(l["price"]): float(l["size"]) for l in asks if float(l["size"]) > 0}
-            book.updated_at = now
-            touched.add(self._by_asset[book.asset_id].slug)
-        elif etype == "price_change":
-            # Format actuel: {"price_changes": [{asset_id, price, size, side}, ...]}
-            # Ancien format: {"asset_id": ..., "changes": [{price, size, side}, ...]}
-            changes = ev.get("price_changes")
-            if changes is None:
-                changes = [{**c, "asset_id": ev.get("asset_id")} for c in ev.get("changes", [])]
-            for c in changes:
-                book = self.books.get(str(c.get("asset_id")))
-                if book is None:
-                    continue
-                side = book.bids if c.get("side", "").upper() == "BUY" else book.asks
-                price, size = float(c["price"]), float(c["size"])
-                if size <= 0:
-                    side.pop(price, None)
-                else:
-                    side[price] = size
-                book.updated_at = now
-                touched.add(self._by_asset[book.asset_id].slug)
-        return touched

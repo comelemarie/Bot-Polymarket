@@ -1,4 +1,12 @@
-"""Boucle principale: ingestion -> filtre local -> Claude -> moteur de risque -> execution."""
+"""Point d'entree.
+
+  python main.py                       # PAPER (defaut): flux reels, aucun ordre reel
+  python main.py --confirm-live        # LIVE, si et seulement si les 4 conditions de core/modes.py sont reunies
+  python main.py --status              # etat: mode, positions, coupe-circuits, ordres incertains
+  python main.py --halt [--flatten]    # arret d'urgence (plus aucune entree; --flatten: sortie des positions)
+  python main.py --resume              # leve les coupe-circuits manuels/drawdown/reconciliation
+Le replay est dans backtest/replay.py, le rapport de performance dans analytics/performance_tracker.py.
+"""
 from __future__ import annotations
 
 import argparse
@@ -7,20 +15,23 @@ import logging
 import signal
 import sys
 import time
-from dataclasses import asdict
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Awaitable, Callable
 
+import httpx
+
+from bot import Bot, LiveScheduler
 from brain.claude_analyst import ClaudeAnalyst
-from core.config import BotConfig, MarketWatch, Secrets, load_config, load_secrets
-from core.models import Market, NewsItem
-from core.state import PortfolioState
-from execution.polygon_clob import ClobExecutor
-from execution.risk_manager import RiskManager, floor_to_tick
-from ingestion.market_discovery import KeywordGenerator, discover_markets, phrase_to_regex
-from ingestion.news_filter import Trigger, TriggerEngine
-from ingestion.polymarket_ws import PolymarketFeed, load_markets
+from core.clock import Clock
+from core.config import BotConfig, load_config, load_secrets
+from core.logging_setup import setup_logging
+from core.modes import LiveGateError, assert_live_allowed, effective_mode
+from core.state import Portfolio
+from core.store import Store
+from execution.paper_broker import PaperBroker
+from ingestion.clob_rest import ClobRest
+from ingestion.polymarket_ws import PolymarketFeed
+from ingestion.recorder import Recorder
 from ingestion.rss_feed import poll_rss
 from ingestion.twitter_stream import run_x
 
@@ -28,19 +39,7 @@ log = logging.getLogger("polybot")
 HEARTBEAT_FILE = Path("state/heartbeat")
 
 
-def setup_logging() -> None:
-    Path("logs").mkdir(exist_ok=True)
-    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
-    file_handler = RotatingFileHandler("logs/bot.log", maxBytes=10_000_000, backupCount=10, encoding="utf-8")
-    file_handler.setFormatter(fmt)
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(fmt)
-    logging.basicConfig(level=logging.INFO, handlers=[file_handler, console])
-    for noisy in ("httpx", "websockets", "anthropic"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-
-
-async def supervised(name: str, factory: Callable[[], Awaitable[None]]) -> None:
+async def supervised(name: str, factory: Callable[[], Awaitable[None]], store: Store, clock: Clock) -> None:
     """Relance une tache qui plante, sans faire tomber les autres."""
     backoff = 5
     while True:
@@ -49,236 +48,175 @@ async def supervised(name: str, factory: Callable[[], Awaitable[None]]) -> None:
             log.warning("Tache %s terminee, relance", name)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as e:
             log.exception("Tache %s plantee, relance dans %ss", name, backoff)
+            store.log_error(clock.now(), name, repr(e))
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 300)
 
 
-class Bot:
-    def __init__(self, cfg: BotConfig, secrets: Secrets, markets: dict[str, Market]):
-        self.cfg = cfg
-        self.secrets = secrets
-        self.markets = markets
-        self.state = PortfolioState()
-        self.feed = PolymarketFeed(markets, cfg.trigger.price_window_s)
-        self.triggers = TriggerEngine(markets, cfg.trigger, lambda slug: self.feed.history[slug].move())
-        self.analyst = ClaudeAnalyst(cfg.claude, secrets.anthropic_api_key)
-        self.risk = RiskManager(cfg.risk)
-        self.executor = ClobExecutor(secrets, cfg.dry_run, self.state, cfg.paper_bankroll_usdc)
-        self.news_queue: asyncio.Queue[NewsItem] = asyncio.Queue(maxsize=10_000)
-        self.trade_lock = asyncio.Lock()  # une seule decision d'ordre a la fois (exposition coherente)
-        self.feed.on_price(self._on_price)
-        self._background: set[asyncio.Task] = set()
-        self.keywords = (
-            KeywordGenerator(secrets.anthropic_api_key, cfg.discovery.keyword_model)
-            if cfg.discovery.enabled else None
-        )
-
-    # --- liste des marches surveilles ---
-    def set_markets(self, markets: dict[str, Market]) -> None:
-        added, removed = markets.keys() - self.markets.keys(), self.markets.keys() - markets.keys()
-        self.markets = markets
-        self.feed.set_markets(markets)  # avant le filtre: il lit l'historique de prix du flux
-        self.triggers.set_markets(markets)
-        if added or removed:
-            log.info("Marches surveilles: %d (+%d / -%d)", len(markets), len(added), len(removed))
-
-    async def refresh_markets(self) -> None:
-        """Liste manuelle + decouverte automatique + marches ou une position est ouverte."""
-        markets = await load_markets(self.cfg.markets) if self.cfg.markets else {}
-        if self.keywords:
-            discovered = await discover_markets(self.cfg.discovery, self.keywords)
-            markets = {**discovered, **markets}  # la liste manuelle garde ses propres mots-cles
-        # Une position ouverte doit rester surveillee (stop-loss) meme si le marche sort des filtres.
-        orphans = {p.market_slug for p in self.state.positions.values()} - markets.keys()
-        for slug in list(orphans):
-            if slug in self.markets:
-                markets[slug] = self.markets[slug]
-                orphans.discard(slug)
-        if orphans:
-            watches = []
-            for slug in orphans:
-                phrases = (self.keywords.cached(slug) if self.keywords else None) or []
-                watches.append(MarketWatch(slug=slug, keywords=[phrase_to_regex(k) for k in phrases]))
-            markets.update(await load_markets(watches))
-        self.set_markets(markets)
-
-    async def discovery_loop(self) -> None:
-        while True:
-            await asyncio.sleep(self.cfg.discovery.refresh_interval_s)
-            try:
-                await self.refresh_markets()
-            except Exception:
-                log.exception("Rafraichissement des marches echoue, on garde la liste actuelle")
-
-    def _spawn(self, trig: Trigger) -> None:
-        """Lance l'analyse en tache de fond (ne bloque pas le WebSocket ni la file d'actus)."""
-        task = asyncio.create_task(self._safe_handle(trig))
-        self._background.add(task)
-        task.add_done_callback(self._background.discard)
-
-    async def _safe_handle(self, trig: Trigger) -> None:
-        try:
-            await self.handle_trigger(trig)
-        except Exception:
-            log.exception("Erreur pendant le traitement du declenchement %s", trig.market.slug)
-
-    # --- valorisation ---
-    def mark_value(self) -> float:
-        total = 0.0
-        for pos in self.state.positions.values():
-            book = self.feed.books.get(pos.token_id)
-            bid = book.best_bid if book else None
-            total += pos.shares * (bid if bid is not None else pos.avg_price)
-        return total
-
-    async def equity(self) -> tuple[float, float]:
-        usdc = await self.executor.usdc_balance()
-        return usdc, usdc + self.mark_value()
-
-    # --- evenements ---
-    async def _on_price(self, market: Market) -> None:
-        trig = self.triggers.on_price(market.slug)
-        if trig:
-            self._spawn(trig)
-
-    async def consume_news(self) -> None:
-        while True:
-            news = await self.news_queue.get()
-            for trig in self.triggers.on_news(news):
-                self._spawn(trig)
-
-    async def handle_trigger(self, trig: Trigger) -> None:
-        market = trig.market
-        if not self.feed.is_fresh(market):
-            log.warning("Carnet de %s pas a jour, declenchement ignore", market.slug)
-            return
-        yes_book, no_book = self.feed.book(market.yes_token_id), self.feed.book(market.no_token_id)
-        assessment = await self.analyst.assess(market, trig.news, yes_book, no_book)
-        self.state.journal(
-            "assessment",
-            market=market.slug,
-            news=[{"source": n.source, "text": n.text, "url": n.url} for n in trig.news],
-            price_move=trig.price_move,
-            yes_mid=yes_book.mid,
-            assessment=asdict(assessment) if assessment else None,
-        )
-        if assessment is None or market.slug not in self.markets:
-            return  # pas d'avis, ou marche retire de la surveillance pendant l'analyse
-
-        async with self.trade_lock:
-            usdc, equity = await self.equity()
-            daily = self.state.roll_day(equity)
-            # Carnets relus apres l'appel a Claude: le prix a pu bouger pendant l'analyse.
-            yes_book, no_book = self.feed.book(market.yes_token_id), self.feed.book(market.no_token_id)
-            verdict = self.risk.evaluate(
-                market, assessment, yes_book, no_book,
-                usdc_balance=usdc,
-                equity=equity,
-                market_exposure=self.state.exposure_for_market(market.slug),
-                total_exposure=self.state.total_exposure(),
-                daily=daily,
-            )
-            self.state.save()
-            self.state.journal("risk", market=market.slug, reason=verdict.reason,
-                               decision=asdict(verdict.decision) if verdict.decision else None)
-            if verdict.decision is None:
-                log.info("Pas de trade sur %s: %s", market.slug, verdict.reason)
-                return
-            d = verdict.decision
-            log.info("TRADE %s %s: %.2f shares @ <=%.3f (%.2f USDC) | %s",
-                     market.slug, d.outcome, d.shares, d.limit_price, d.size_usdc, d.reason)
-            fill = await self.executor.buy(d.token_id, d.limit_price, d.shares, self.feed.book(d.token_id))
-            if fill:
-                self.state.add_fill(market.slug, d.token_id, d.outcome, fill.price, fill.shares)
-                self.state.journal("fill", market=market.slug, fill=asdict(fill))
-
-    # --- surveillance des positions (stop-loss / take-profit) ---
-    async def monitor_positions(self) -> None:
-        while True:
-            await asyncio.sleep(self.cfg.risk.position_check_interval_s)
-            async with self.trade_lock:
-                for token_id, pos in list(self.state.positions.items()):
-                    market = self.markets.get(pos.market_slug)
-                    book = self.feed.books.get(token_id)
-                    if market is None or book is None or not self.feed.is_fresh(market):
-                        continue
-                    reason = self.risk.exit_signal(pos, book.best_bid)
-                    if not reason:
-                        continue
-                    log.warning("SORTIE %s %s: %s", pos.market_slug, pos.outcome, reason)
-                    limit = floor_to_tick(max(book.best_bid - self.cfg.risk.max_slippage, market.tick_size),
-                                          market.tick_size)
-                    fill = await self.executor.sell(token_id, limit, pos.shares, book)
-                    if fill:
-                        pnl = self.state.reduce(token_id, fill.price, fill.shares)
-                        self.state.journal("exit", market=pos.market_slug, reason=reason,
-                                           fill=asdict(fill), pnl=pnl)
-                        log.warning("Position fermee, PnL realise %.2f USDC", pnl)
-                    else:
-                        log.error("Sortie impossible pour %s (carnet trop fin), nouvel essai au prochain cycle",
-                                  pos.market_slug)
-
-    async def heartbeat(self) -> None:
-        while True:
-            HEARTBEAT_FILE.parent.mkdir(exist_ok=True)
-            HEARTBEAT_FILE.write_text(str(int(time.time())))
-            usdc, equity = await self.equity()
-            self.state.roll_day(equity)
-            log.info("Heartbeat: USDC %.2f | equity %.2f | %d position(s) | exposition %.2f",
-                     usdc, equity, len(self.state.positions), self.state.total_exposure())
-            await asyncio.sleep(300)
-
-    async def run(self) -> None:
-        await self.executor.start()
-        tasks = [
-            supervised("polymarket_ws", self.feed.run),
-            supervised("news_consumer", self.consume_news),
-            supervised("positions", self.monitor_positions),
-            supervised("heartbeat", self.heartbeat),
-        ]
-        if self.cfg.discovery.enabled:
-            tasks.append(supervised("discovery", self.discovery_loop))
-        if self.cfg.news.rss.enabled and self.cfg.news.rss.feeds:
-            tasks.append(supervised("rss", lambda: poll_rss(self.cfg.news.rss, self.news_queue)))
-        if self.cfg.news.x.enabled:
-            if not self.secrets.x_bearer_token:
-                log.error("X active dans config.json mais X_BEARER_TOKEN absent: source X desactivee")
-            else:
-                tasks.append(supervised("x", lambda: run_x(self.cfg.news.x, self.secrets.x_bearer_token,
-                                                           self.news_queue)))
-        await asyncio.gather(*tasks)
+async def every(seconds: float, fn: Callable[[], Awaitable[object]]) -> None:
+    while True:
+        await asyncio.sleep(seconds)
+        await fn()
 
 
-async def amain(config_path: str) -> None:
-    cfg = load_config(config_path)
+def build_broker(mode: str, secrets, portfolio: Portfolio, cfg: BotConfig):
+    if mode == "live":
+        from execution.polygon_clob import LiveClobBroker  # importe uniquement en LIVE
+
+        return LiveClobBroker(secrets)
+    return PaperBroker(portfolio, cfg.paper_bankroll_usdc)
+
+
+async def run(cfg: BotConfig, mode: str) -> None:
     secrets = load_secrets()
-    if not secrets.anthropic_api_key:
-        log.warning("ANTHROPIC_API_KEY absent de .env: le SDK tentera les autres sources d'identifiants")
-    bot = Bot(cfg, secrets, {})
-    await bot.refresh_markets()
-    if not bot.markets:
-        log.error("Aucun marche a surveiller (liste manuelle vide/invalide et decouverte sans resultat), arret.")
-        sys.exit(1)
+    clock = Clock()
+    store = Store(cfg.storage.db_path)
+    store.log_error(clock.now(), "startup", f"demarrage en mode {mode.upper()}")
+    portfolio = Portfolio(store)
+    broker = build_broker(mode, secrets, portfolio, cfg)
+    await broker.start()
+    rest = ClobRest(cfg.fees, clock)
+    recorder = Recorder(cfg.storage.record_dir) if cfg.storage.record_market_data else None
+    analyst = ClaudeAnalyst(cfg.claude, secrets.anthropic_api_key, store, clock)
+    keyword_gen = None
+    if cfg.discovery.enabled:
+        from ingestion.market_discovery import KeywordGenerator
 
-    loop = asyncio.get_running_loop()
-    main_task = asyncio.current_task()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, main_task.cancel)
+        keyword_gen = KeywordGenerator(secrets.anthropic_api_key, cfg.discovery.keyword_model)
+    scheduler = LiveScheduler(clock)
+    bot = Bot(cfg, secrets, mode, clock, store, broker, analyst, rest, scheduler, recorder, keyword_gen)
+    feed = PolymarketFeed(bot.state, cfg.market_data, clock, bot.on_book_update, recorder)
+    bot.on_markets_changed = feed.request_resubscribe
+
     try:
-        await bot.run()
-    except asyncio.CancelledError:
-        log.info("Arret demande, etat sauvegarde.")
-        bot.state.save()
+        await bot.refresh_markets()  # avant la reprise: la reconciliation a besoin des marches
+    except httpx.HTTPError as e:
+        # Reseau pas encore disponible au demarrage, API indisponible...: launchd relancera le processus.
+        log.error("API Polymarket (Gamma) injoignable au demarrage: %s. Arret, nouvel essai au prochain lancement.", e)
+        await rest.close()
+        sys.exit(1)
+    await bot.execution.recover_on_startup()
+    if not bot.markets:
+        log.error("Aucun marche a surveiller, arret.")
+        sys.exit(1)
+    log.warning("MODE %s | %d marches | solde %s USDC | coupe-circuits: %s", mode.upper(), len(bot.markets),
+                await broker.balance(), list(portfolio.halts()) or "aucun")
+
+    news_queue: asyncio.Queue = asyncio.Queue(maxsize=10_000)
+
+    async def consume_news():
+        while True:
+            await bot.on_news(await news_queue.get())
+
+    async def heartbeat():
+        await bot.heartbeat()
+        HEARTBEAT_FILE.parent.mkdir(exist_ok=True)
+        HEARTBEAT_FILE.write_text(str(int(clock.now())))
+        if recorder:
+            recorder.flush()
+
+    async def safe(fn):
+        try:
+            await fn()
+        except Exception:
+            log.exception("Erreur periodique dans %s", getattr(fn, "__name__", fn))
+
+    tasks = [
+        supervised("polymarket_ws", feed.run, store, clock),
+        supervised("news_consumer", consume_news, store, clock),
+        supervised("positions", lambda: every(cfg.exits.check_interval_s, lambda: safe(bot.check_positions)), store, clock),
+        supervised("emergency", lambda: every(5, lambda: safe(bot.check_emergency)), store, clock),
+        supervised("heartbeat", lambda: every(300, lambda: safe(heartbeat)), store, clock),
+        supervised("resolutions", lambda: every(3600, lambda: safe(bot.check_resolutions)), store, clock),
+    ]
+    if mode == "live":
+        tasks.append(supervised("reconcile", lambda: every(300, bot.execution.reconcile), store, clock))
+    if cfg.news.rss.enabled and cfg.news.rss.feeds:
+        tasks.append(supervised("rss", lambda: poll_rss(cfg.news, news_queue, clock), store, clock))
+    if cfg.news.x.enabled:
+        if secrets.x_bearer_token:
+            tasks.append(supervised("x", lambda: run_x(cfg.news, secrets.x_bearer_token, news_queue, clock), store, clock))
+        else:
+            log.error("X active mais X_BEARER_TOKEN absent: source X desactivee")
+    if cfg.discovery.enabled:
+        tasks.append(supervised("discovery", lambda: every(cfg.discovery.refresh_interval_s,
+                                                           lambda: safe(bot.refresh_markets)), store, clock))
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        # L'arret du processus n'annule rien sur le marche: voir docs/OPERATIONS.md.
+        store.log_error(clock.now(), "shutdown", "arret du processus")
+        if recorder:
+            recorder.close()
+        await rest.close()
+
+
+def cmd_status(cfg: BotConfig) -> None:
+    store = Store(cfg.storage.db_path)
+    p = Portfolio(store)
+    print(f"Mode configure: {cfg.mode.upper()}")
+    print(f"Coupe-circuits: {p.halts() or 'aucun'} | jour: {store.kv_get('daily')}")
+    print(f"Liquidites papier: {p.paper_usdc}")
+    for pos in p.positions().values():
+        print(f"  {pos.market_slug} {pos.outcome}: {pos.shares:.2f} parts @ {pos.avg_price:.4f} ({pos.status})")
+    for r in store.query("SELECT client_order_id, status, error FROM orders WHERE status IN ('intent','unknown')"):
+        print(f"  ORDRE INCERTAIN {r['client_order_id']}: {r['status']} {r['error']}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Bot Polymarket pilote par l'actualite")
     parser.add_argument("--config", default="config.json")
+    parser.add_argument("--mode", choices=["paper"], help="force PAPER quelle que soit la configuration")
+    parser.add_argument("--confirm-live", action="store_true", help="une des 4 conditions du mode LIVE")
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--halt", action="store_true", help="arret d'urgence: plus aucune nouvelle entree")
+    parser.add_argument("--flatten", action="store_true", help="avec --halt: tenter de sortir de toutes les positions")
+    parser.add_argument("--resume", action="store_true", help="lever les coupe-circuits (apres analyse!)")
     args = parser.parse_args()
-    setup_logging()
-    asyncio.run(amain(args.config))
+    cfg = load_config(args.config)
+
+    if args.status:
+        return cmd_status(cfg)
+    if args.halt or args.resume:
+        store, now = Store(cfg.storage.db_path), time.time()
+        p = Portfolio(store)
+        if args.halt:
+            p.halt("manuel", "arret d'urgence demande en ligne de commande", now)
+            store.kv_set("emergency_request", {"flatten": args.flatten, "ts": now}, now)
+            print("Arret d'urgence enregistre: plus aucune entree."
+                  + (" Sortie des positions demandee au bot en cours d'execution." if args.flatten else ""))
+        else:
+            p.clear_halts(now)
+            print("Coupe-circuits leves.")
+        return
+
+    secrets = load_secrets()
+    setup_logging(secrets.values())
+    mode = effective_mode(cfg, args.mode)
+    if mode == "replay":
+        sys.exit("Le mode REPLAY se lance avec: python -m backtest.replay --help")
+    if mode == "live":
+        try:
+            assert_live_allowed(cfg, secrets, args.confirm_live)
+        except LiveGateError as e:
+            log.error("%s", e)
+            sys.exit(2)
+    elif args.confirm_live:
+        log.warning("--confirm-live ignore: le mode configure est %s", mode.upper())
+
+    async def runner():
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, task.cancel)
+        try:
+            await run(cfg, mode)
+        except asyncio.CancelledError:
+            log.info("Arret demande.")
+
+    asyncio.run(runner())
 
 
 if __name__ == "__main__":
